@@ -1024,12 +1024,11 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     public void authorizeGetObject(String bucketName, String key, String versionId, RequestAuthorization authorization) {
-        String action = versionId != null ? "s3:GetObjectVersion" : "s3:GetObject";
         if (enforceAuth && versionId == null && isUnsignedRequest(authorization) && !readableObjectExists(bucketName, key)) {
             authorizeMissingObjectRead(bucketName, authorization);
             return;
         }
-        authorizeObjectRead(bucketName, key, versionId, action, authorization);
+        authorizeObjectRead(bucketName, key, versionId, "s3:GetObject", authorization);
     }
 
     public void authorizeAnonymousGetObject(String bucketName, String key) {
@@ -1170,7 +1169,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 : RequestAuthorization.unsigned();
         if (requestAuthorization.signed()) {
             String bucketArn = S3PublicAccessEvaluator.bucketArn(bucketPartition(bucketName), bucketName);
-            authorizeSignedBucketPolicy(bucketName, null, action, bucketArn, requestAuthorization);
+            authorizeSignedBucketPolicy(bucketName, null, action, bucketArn, requestAuthorization, null);
             return;
         }
 
@@ -1196,9 +1195,14 @@ public class S3Service implements Resettable, ResourceProvider {
         throw accessDeniedException(bucketName, null);
     }
 
+    /**
+     * Authorizes a read of one object, or of the version {@code versionId} names, in which case the
+     * action's version counterpart is checked in its place (see {@link S3ObjectActions#forVersion}).
+     */
     void authorizeObjectRead(String bucketName, String key, String versionId, String action, RequestAuthorization authorization) {
         String objectArn = S3PublicAccessEvaluator.objectArn(bucketPartition(bucketName), bucketName, key);
-        authorizeS3Read(bucketName, key, versionId, action, objectArn, authorization);
+        authorizeS3Read(bucketName, key, versionId, S3ObjectActions.forVersion(action, versionId), objectArn,
+                authorization);
     }
 
     void authorizePutObject(String bucketName, String key, RequestAuthorization authorization) {
@@ -1206,11 +1210,29 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     void authorizeDeleteObject(String bucketName, String key, String versionId, RequestAuthorization authorization) {
-        String action = versionId != null ? "s3:DeleteObjectVersion" : "s3:DeleteObject";
-        authorizeObjectWrite(bucketName, key, action, authorization);
+        authorizeObjectWrite(bucketName, key, versionId, "s3:DeleteObject", authorization);
+    }
+
+    /**
+     * {@link #authorizeObjectWrite(String, String, String, RequestAuthorization)} on the version
+     * {@code versionId} names, checked as the action's version counterpart.
+     */
+    void authorizeObjectWrite(String bucketName, String key, String versionId, String action,
+                              RequestAuthorization authorization) {
+        authorizeObjectWrite(bucketName, key, S3ObjectActions.forVersion(action, versionId), authorization);
     }
 
     void authorizeObjectWrite(String bucketName, String key, String action, RequestAuthorization authorization) {
+        authorizeObjectWrite(bucketName, key, action, authorization, null);
+    }
+
+    /**
+     * Authorizes a write of one object, evaluating a signed request's bucket policy with
+     * {@code requestConditions}, the condition keys the request itself offers, besides the ones that
+     * say who is calling. An unsigned request's public-policy check has no condition context.
+     */
+    void authorizeObjectWrite(String bucketName, String key, String action, RequestAuthorization authorization,
+                              Map<String, List<String>> requestConditions) {
         if (!enforceAuth) {
             return;
         }
@@ -1221,7 +1243,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 : RequestAuthorization.unsigned();
         if (requestAuthorization.signed()) {
             String objectArn = S3PublicAccessEvaluator.objectArn(bucketPartition(bucketName), bucketName, key);
-            authorizeSignedBucketPolicy(bucketName, key, action, objectArn, requestAuthorization);
+            authorizeSignedBucketPolicy(bucketName, key, action, objectArn, requestAuthorization, requestConditions);
             return;
         }
 
@@ -1290,7 +1312,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 : RequestAuthorization.unsigned();
 
         if (requestAuthorization.signed()) {
-            authorizeSignedBucketPolicy(bucketName, key, action, resourceArn, requestAuthorization);
+            authorizeSignedBucketPolicy(bucketName, key, action, resourceArn, requestAuthorization, null);
             return;
         }
 
@@ -1340,7 +1362,8 @@ public class S3Service implements Resettable, ResourceProvider {
             String key,
             String action,
             String resourceArn,
-            RequestAuthorization authorization) {
+            RequestAuthorization authorization,
+            Map<String, List<String>> requestConditions) {
         if (!isKnownAccessKey(authorization)) {
             throw new AwsException("InvalidAccessKeyId",
                     "The AWS Access Key Id you provided does not exist in our records.", 403);
@@ -1382,7 +1405,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 RequestPrincipal.caller(caller),
                 action,
                 resourceArn,
-                bucketPolicyContext(caller));
+                bucketPolicyContext(caller, requestConditions));
 
         if (decision == ResourcePolicyDecision.EXPLICIT_DENY) {
             throw accessDeniedException(bucketName, key);
@@ -1423,10 +1446,15 @@ public class S3Service implements Resettable, ResourceProvider {
      * never a service, and the keys that say who is calling are the ones
      * {@link CallerArns#putPrincipalKeys} writes, so a bucket policy sees the same principal
      * whether S3 evaluates it or the enforcement filter does. For a role session
-     * {@code aws:PrincipalArn} is the role's ARN.
+     * {@code aws:PrincipalArn} is the role's ARN. {@code requestConditions}, when present, are the
+     * keys the request offers, such as an object creation's tags and Object Lock settings.
      */
-    private static Map<String, List<String>> bucketPolicyContext(CallerArns caller) {
+    private static Map<String, List<String>> bucketPolicyContext(CallerArns caller,
+                                                                 Map<String, List<String>> requestConditions) {
         Map<String, List<String>> context = new HashMap<>();
+        if (requestConditions != null) {
+            context.putAll(requestConditions);
+        }
         context.put("aws:PrincipalIsAWSService", List.of("false"));
         if (caller != null) {
             caller.putPrincipalKeys(context);
@@ -1480,7 +1508,7 @@ public class S3Service implements Resettable, ResourceProvider {
                         RequestPrincipal.caller(caller.get()),
                         action,
                         resourceArn,
-                        bucketPolicyContext(caller.get()));
+                        bucketPolicyContext(caller.get(), null));
         return new SignedPrincipalResourcePolicyEvaluation(decision, ownedBucket.account());
     }
 
@@ -1854,6 +1882,27 @@ public class S3Service implements Resettable, ResourceProvider {
         if (object.isDeleteMarker()) {
             throw new AwsException("NoSuchKey", "The specified key does not exist.", 404);
         }
+        return new AccountAwareStorageBackend.OwnedEntry<>(ownedBucket.account(), object);
+    }
+
+    /**
+     * The version {@code versionId} names, or the current version when it is null. The literal
+     * {@code "null"} names the null version, resolved as deleteObjectLocked resolves it: the object at
+     * the plain key, when that object has no version id. Any other current version is not it, and
+     * floci keeps no null version beside one (S3 keeps a replaced null version as noncurrent), so the
+     * request names a version that does not exist.
+     */
+    private AccountAwareStorageBackend.OwnedEntry<S3Object> getVersionEntry(
+            String bucketName, String key, String versionId) {
+        if (!"null".equals(versionId)) {
+            return getStoredObjectEntry(bucketName, key, versionId);
+        }
+        AccountAwareStorageBackend.OwnedEntry<Bucket> ownedBucket = resolveBucketEntry(bucketName)
+                .orElseThrow(() -> new AwsException("NoSuchBucket",
+                        "The specified bucket does not exist.", 404));
+        S3Object object = resolveObjectForAccount(ownedBucket.account(), objectKey(bucketName, key))
+                .filter(existing -> !existing.isDeleteMarker() && existing.getVersionId() == null)
+                .orElseThrow(() -> new AwsException("NoSuchVersion", "The specified version does not exist.", 404));
         return new AccountAwareStorageBackend.OwnedEntry<>(ownedBucket.account(), object);
     }
 
@@ -2695,31 +2744,39 @@ public class S3Service implements Resettable, ResourceProvider {
     // --- Object Tagging ---
 
     public void putObjectTagging(String bucketName, String key, Map<String, String> tags) {
-        AccountAwareStorageBackend.OwnedEntry<S3Object> ownedObject =
-                getStoredObjectEntry(bucketName, key, null);
+        putObjectTagging(bucketName, key, null, tags);
+    }
+
+    /** Replaces the tags of one version, or of the current version when {@code versionId} is null. */
+    public void putObjectTagging(String bucketName, String key, String versionId, Map<String, String> tags) {
+        AccountAwareStorageBackend.OwnedEntry<S3Object> ownedObject = getVersionEntry(bucketName, key, versionId);
         S3Object obj = ownedObject.value();
         obj.setTags(tags != null ? tags : new java.util.HashMap<>());
         putObjectMetadataForAccount(ownedObject.account(), bucketName, key, obj);
-        LOG.debugv("Put tags on object: {0}/{1}", bucketName, key);
+        LOG.debugv("Put tags on object: {0}/{1} version {2}", bucketName, key, versionId);
     }
 
     public Map<String, String> getObjectTagging(String bucketName, String key) {
         return getObjectTagging(bucketName, key, null);
     }
 
-    /** Tags of one version, or of the current version when {@code versionId} is null or "null". */
+    /** Tags of one version, or of the current version when {@code versionId} is null. */
     public Map<String, String> getObjectTagging(String bucketName, String key, String versionId) {
-        S3Object obj = getStoredObject(bucketName, key, "null".equals(versionId) ? null : versionId);
+        S3Object obj = getVersionEntry(bucketName, key, versionId).value();
         return obj.getTags() != null ? obj.getTags() : Map.of();
     }
 
     public void deleteObjectTagging(String bucketName, String key) {
-        AccountAwareStorageBackend.OwnedEntry<S3Object> ownedObject =
-                getStoredObjectEntry(bucketName, key, null);
+        deleteObjectTagging(bucketName, key, null);
+    }
+
+    /** Removes the tags of one version, or of the current version when {@code versionId} is null. */
+    public void deleteObjectTagging(String bucketName, String key, String versionId) {
+        AccountAwareStorageBackend.OwnedEntry<S3Object> ownedObject = getVersionEntry(bucketName, key, versionId);
         S3Object obj = ownedObject.value();
         obj.setTags(new java.util.HashMap<>());
         putObjectMetadataForAccount(ownedObject.account(), bucketName, key, obj);
-        LOG.debugv("Deleted tags from object: {0}/{1}", bucketName, key);
+        LOG.debugv("Deleted tags from object: {0}/{1} version {2}", bucketName, key, versionId);
     }
 
     // --- Object Annotations ---
@@ -3814,11 +3871,43 @@ public class S3Service implements Resettable, ResourceProvider {
                                                    String sseCustomerAlgorithm, String sseCustomerKey, String sseCustomerKeyMd5,
                                                    String checksumAlgorithm, String checksumType,
                                                    Map<String, String> tagging) {
+        return initiateMultipartUpload(bucket, key, contentType, metadata, checksumType, new PutObjectOptions()
+                .withStorageClass(storageClass)
+                .withContentDisposition(contentDisposition)
+                .withServerSideEncryption(serverSideEncryption)
+                .withAcl(acl)
+                .withSseKmsKeyId(sseKmsKeyId)
+                .withSseCustomerAlgorithm(sseCustomerAlgorithm)
+                .withSseCustomerKey(sseCustomerKey)
+                .withSseCustomerKeyMd5(sseCustomerKeyMd5)
+                .withChecksumAlgorithm(checksumAlgorithm)
+                .withTagging(tagging));
+    }
+
+    /**
+     * Starts a multipart upload of an object that gets {@code objectOptions} when it completes, as a
+     * PutObject takes them: its storage class, encryption, checksum algorithm, canned ACL or grants,
+     * tags and Object Lock settings. The ACL is checked here, so a malformed one fails the upload's
+     * creation rather than its completion.
+     */
+    public MultipartUpload initiateMultipartUpload(String bucket, String key, String contentType,
+                                                   Map<String, String> metadata, String checksumType,
+                                                   PutObjectOptions objectOptions) {
+        String storageClass = objectOptions.getStorageClass();
+        String contentDisposition = objectOptions.getContentDisposition();
+        String serverSideEncryption = objectOptions.getServerSideEncryption();
+        String acl = objectOptions.getAcl();
+        String sseKmsKeyId = objectOptions.getSseKmsKeyId();
+        String sseCustomerAlgorithm = objectOptions.getSseCustomerAlgorithm();
+        String sseCustomerKey = objectOptions.getSseCustomerKey();
+        String sseCustomerKeyMd5 = objectOptions.getSseCustomerKeyMd5();
+        String checksumAlgorithm = objectOptions.getChecksumAlgorithm();
+        Map<String, String> tagging = objectOptions.getTagging();
         return withMultipartBucketReadLock(bucket, () -> {
             ensureBucketExists(bucket);
-            if (acl != null && !acl.isBlank()) {
-                cannedObjectAclXml(acl);
-            }
+            resolveObjectAclXml(getBucketOwnerAccountId(bucket), acl, objectOptions.getGrantRead(),
+                    objectOptions.getGrantWrite(), objectOptions.getGrantFullControl(),
+                    objectOptions.getGrantReadAcp(), objectOptions.getGrantWriteAcp());
             String normalizedServerSideEncryption = normalizeServerSideEncryption(serverSideEncryption);
             SseCustomerKey customerKey = validateSseCustomerKey(sseCustomerAlgorithm, sseCustomerKey, sseCustomerKeyMd5);
             rejectConflictingServerSideEncryption(normalizedServerSideEncryption, customerKey);
@@ -3837,6 +3926,14 @@ public class S3Service implements Resettable, ResourceProvider {
                 upload.setSseCustomerKeyMd5(customerKey.keyMd5());
             }
             upload.setAcl(acl);
+            upload.setGrantRead(objectOptions.getGrantRead());
+            upload.setGrantWrite(objectOptions.getGrantWrite());
+            upload.setGrantFullControl(objectOptions.getGrantFullControl());
+            upload.setGrantReadAcp(objectOptions.getGrantReadAcp());
+            upload.setGrantWriteAcp(objectOptions.getGrantWriteAcp());
+            upload.setObjectLockMode(objectOptions.getObjectLockMode());
+            upload.setRetainUntilDate(objectOptions.getRetainUntilDate());
+            upload.setLegalHoldStatus(objectOptions.getLegalHoldStatus());
             ChecksumAlgorithm algorithm = ChecksumAlgorithm.fromWireValue(checksumAlgorithm);
             ChecksumType requestedChecksumType = ChecksumType.fromWireValue(checksumType);
             if (requestedChecksumType != null && algorithm == null) {
@@ -4280,6 +4377,14 @@ public class S3Service implements Resettable, ResourceProvider {
                                     .withServerSideEncryption(upload.getServerSideEncryption())
                                     .withSseKmsKeyId(upload.getSseKmsKeyId())
                                     .withAcl(upload.getAcl())
+                                    .withGrantRead(upload.getGrantRead())
+                                    .withGrantWrite(upload.getGrantWrite())
+                                    .withGrantFullControl(upload.getGrantFullControl())
+                                    .withGrantReadAcp(upload.getGrantReadAcp())
+                                    .withGrantWriteAcp(upload.getGrantWriteAcp())
+                                    .withObjectLockMode(upload.getObjectLockMode())
+                                    .withRetainUntilDate(upload.getRetainUntilDate())
+                                    .withLegalHoldStatus(upload.getLegalHoldStatus())
                                     .withTagging(upload.getTagging()),
                             compositeETag);
                 } finally {
@@ -6635,6 +6740,9 @@ public class S3Service implements Resettable, ResourceProvider {
                         .withGrantFullControl(effectiveOptions.getGrantFullControl())
                         .withGrantReadAcp(effectiveOptions.getGrantReadAcp())
                         .withGrantWriteAcp(effectiveOptions.getGrantWriteAcp())
+                        .withObjectLockMode(effectiveOptions.getObjectLockMode())
+                        .withRetainUntilDate(effectiveOptions.getRetainUntilDate())
+                        .withLegalHoldStatus(effectiveOptions.getLegalHoldStatus())
                         .withChecksumAlgorithm(copyChecksumAlgorithm != null ? copyChecksumAlgorithm.name() : null)
                         .withTagging(effectiveTags)
                         .withIfMatch(effectiveOptions.getIfMatch())

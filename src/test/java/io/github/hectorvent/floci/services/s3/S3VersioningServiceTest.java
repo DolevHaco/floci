@@ -344,6 +344,46 @@ class S3VersioningServiceTest {
     }
 
     @Test
+    void taggingAVersionChangesOnlyThatVersion() {
+        s3Service.putBucketVersioning("versioned-bucket", "Enabled");
+        S3Object v1 = s3Service.putObject("versioned-bucket", "key",
+                "v1".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+        s3Service.putObject("versioned-bucket", "key", "v2".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+        s3Service.putObjectTagging("versioned-bucket", "key", Map.of("version", "current"));
+
+        s3Service.putObjectTagging("versioned-bucket", "key", v1.getVersionId(), Map.of("version", "first"));
+        assertEquals(Map.of("version", "first"),
+                s3Service.getObjectTagging("versioned-bucket", "key", v1.getVersionId()));
+        assertEquals(Map.of("version", "current"), s3Service.getObjectTagging("versioned-bucket", "key"));
+
+        s3Service.deleteObjectTagging("versioned-bucket", "key", v1.getVersionId());
+        assertEquals(Map.of(), s3Service.getObjectTagging("versioned-bucket", "key", v1.getVersionId()));
+        assertEquals(Map.of("version", "current"), s3Service.getObjectTagging("versioned-bucket", "key"));
+    }
+
+    @Test
+    void versionIdNullNamesTheNullVersionAndNoOther() {
+        // An object written before versioning is the null version.
+        s3Service.putObject("versioned-bucket", "old", "v0".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+        s3Service.putBucketVersioning("versioned-bucket", "Enabled");
+        s3Service.putObjectTagging("versioned-bucket", "old", "null", Map.of("version", "null"));
+        assertEquals(Map.of("version", "null"), s3Service.getObjectTagging("versioned-bucket", "old", "null"));
+
+        // A key written only with versioning on has no null version, and its current version is
+        // not one: a request naming the null version fails and leaves the current one alone.
+        s3Service.putObject("versioned-bucket", "new", "v1".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+        s3Service.putObjectTagging("versioned-bucket", "new", Map.of("version", "current"));
+        for (Runnable request : List.<Runnable>of(
+                () -> s3Service.getObjectTagging("versioned-bucket", "new", "null"),
+                () -> s3Service.putObjectTagging("versioned-bucket", "new", "null", Map.of("version", "other")),
+                () -> s3Service.deleteObjectTagging("versioned-bucket", "new", "null"))) {
+            AwsException e = assertThrows(AwsException.class, request::run);
+            assertEquals("NoSuchVersion", e.getErrorCode());
+        }
+        assertEquals(Map.of("version", "current"), s3Service.getObjectTagging("versioned-bucket", "new"));
+    }
+
+    @Test
     void copyObjectPreservesSourceTagsByDefault() {
         s3Service.putBucketVersioning("versioned-bucket", "Enabled");
         s3Service.putObject("versioned-bucket", "key",

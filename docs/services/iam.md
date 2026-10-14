@@ -1114,6 +1114,58 @@ a Query `Action` field on it does not change the action it is checked as, and it
 still percent-encoded, as the router matches it, so an encoded `/` inside a parameter cannot make
 the route's rule miss.
 
+An S3 object operation is checked as the action the S3 documentation gives it:
+- **Multipart uploads:**
+  - `CreateMultipartUpload`, `UploadPart` and `CompleteMultipartUpload` are checked as
+    `s3:PutObject`.
+  - `AbortMultipartUpload` is checked as `s3:AbortMultipartUpload`.
+  - `ListParts` is checked as `s3:ListMultipartUploadParts`.
+  - A `CompleteMultipartUpload` carrying `If-Match` also needs `s3:GetObject`, as a `PutObject`
+    does.
+- **Creating an object:** a `PutObject`, `CopyObject` or `CreateMultipartUpload` also needs
+  the action for each setting it applies to the new object, as the S3 user guide's permissions
+  table marks them conditionally required:
+  - `s3:PutObjectTagging` for tags: the `x-amz-tagging` header, which a copy applies only with
+    `x-amz-tagging-directive: REPLACE`, or a tagged source's tags, which a copy keeps under the
+    default `COPY`;
+  - `s3:PutObjectAcl` for a canned ACL or a grant header;
+  - `s3:PutObjectRetention` for `x-amz-object-lock-mode` or `x-amz-object-lock-retain-until-date`;
+  - `s3:PutObjectLegalHold` for `x-amz-object-lock-legal-hold`.
+- **Restore and select:** `RestoreObject` is checked as `s3:RestoreObject`, and
+  `SelectObjectContent` as `s3:GetObject`, or `s3:GetObjectVersion` when it names a version.
+- **Attributes:** `GetObjectAttributes` needs `s3:GetObject` and `s3:GetObjectAttributes`, as its
+  API reference says.
+- **Object lock:**
+  - Object retention and legal hold use their own actions: `s3:GetObjectRetention`,
+    `s3:PutObjectRetention`, `s3:GetObjectLegalHold` and `s3:PutObjectLegalHold`.
+  - A `PutObjectRetention` that sends `x-amz-bypass-governance-retention: true` also needs
+    `s3:BypassGovernanceRetention`.
+- **Annotations:** object annotations use the `s3:*ObjectAnnotation` actions, and
+  `s3:ListObjectAnnotations` when no annotation name is given. A `DeleteObjectAnnotation` that
+  sends `x-amz-bypass-governance-retention: true` also needs `s3:BypassGovernanceRetention`.
+- **Versions:** a `versionId` selects the version action AWS checks.
+  - Reading or heading a version needs `s3:GetObjectVersion`; `s3:GetObject` is not needed. Its
+    attributes need `s3:GetObjectVersion` and `s3:GetObjectVersionAttributes`.
+  - Deleting a version needs `s3:DeleteObjectVersion`, so a deny on it stops permanent deletes
+    while a plain delete still adds a delete marker.
+  - A version's ACL, tags and annotations use `s3:GetObjectVersionAcl`, `s3:PutObjectVersionAcl`,
+    the `s3:*ObjectVersionTagging` actions and the `s3:*ObjectVersionAnnotation(s)` actions.
+  - A delete that sends `x-amz-bypass-governance-retention: true` also needs
+    `s3:BypassGovernanceRetention`.
+  - Deleting a version with an `If-Match` ETag also needs `s3:GetObject`, as a plain conditional
+    delete does: the S3 user guide says the condition is evaluated against the current version.
+- **Bucket configurations:**
+  - Analytics, inventory and Intelligent-Tiering configurations use
+    `s3:Get/PutAnalyticsConfiguration`, `s3:Get/PutInventoryConfiguration` and
+    `s3:Get/PutIntelligentTieringConfiguration`.
+  - Removing a configuration needs its Put action.
+  - `DeleteBucketTagging` is checked as `s3:PutBucketTagging`, since AWS has no
+    `s3:DeleteBucketTagging` action.
+
+A request naming several of these sub-resources is checked as the one S3 runs. `GET ?acl&tagging`
+returns the tags, so it needs `s3:GetObjectTagging`. S3's own bucket-policy check, which
+`FLOCI_SERVICES_S3_ENFORCE_AUTH` turns on, checks the same actions against the bucket policy.
+
 A request that names its operation, in a Query `Action`, an `X-Amz-Target` header or a Smithy RPC v2
 path (`/service/<service>/operation/<operation>`), is authorized as the action AWS checks for that
 operation, which is usually the operation's own name. An RPC v2 call is checked as the service and
@@ -1378,14 +1430,15 @@ floci populates:
   `s3:PutBucketTagging` (the `<Tagging>` body).
 - `aws:ResourceTag/<key>`: the target resource's current tags, for `ec2:CreateTags`,
   `ec2:DeleteTags`, `ec2:TerminateInstances` and `ec2:DescribeInstances` (the first
-  `ResourceId.N` or `InstanceId.N`), and for `s3:GetBucketTagging`, `s3:DeleteBucketTagging`
-  and `s3:DeleteBucket` (the bucket). A request naming several EC2 resources is evaluated
+  `ResourceId.N` or `InstanceId.N`), and for `s3:GetBucketTagging`, `s3:DeleteBucket` and the
+  `s3:PutBucketTagging` that `DeleteBucketTagging` is checked as (the bucket). A request naming several EC2 resources is evaluated
   once per resource and denied when any of them fails the condition, as on AWS.
   `logs:CreateLogStream` and `logs:DeleteLogStream` use the owning log group's tags.
 - `s3:ExistingObjectTag/<key>`: the tags already on the target object version, for
   `s3:GetObject`, `s3:GetObjectTagging`, `s3:GetObjectAcl`, `s3:PutObjectAcl`,
-  `s3:DeleteObjectTagging` and `s3:PutObjectTagging`. A `versionId` in the request selects the
-  version whose tags are read. **`s3:DeleteObject` and `s3:PutObject` do not receive this key**, as measured on AWS.
+  `s3:DeleteObjectTagging`, `s3:PutObjectTagging` and the annotation actions, and for their
+  version actions (`s3:GetObjectVersion`, `s3:GetObjectVersionTagging` and so on). A `versionId` in the request
+  selects the version whose tags are read. **`s3:DeleteObject` and `s3:PutObject` do not receive this key**, as measured on AWS.
   An allow conditioned on it denies the delete of a correctly tagged object, and a create cannot
   be gated on tags an object does not have yet.
 - `s3:RequestObjectTag/<key>`: a tag the request asks to attach. `s3:PutObject` reads these
@@ -1400,6 +1453,17 @@ floci populates:
   `ForAllValues:StringEquals` can limit all requested keys without a `Null` guard; an
   omitted or empty tag set still follows the absent-key rules above. Existing object tags
   do not contribute to this requested set. See the [AWS object-tag policy guidance](https://docs.aws.amazon.com/AmazonS3/latest/userguide/tagging-and-policies.html).
+- `s3:versionid`: the `versionId` of the request, for the version actions it selects.
+- `s3:object-lock-mode`, `s3:object-lock-retain-until-date`,
+  `s3:object-lock-remaining-retention-days` and `s3:object-lock-legal-hold`: the Object Lock
+  settings a request applies, for `s3:PutObject` (from its `x-amz-object-lock-*` headers),
+  `s3:PutObjectRetention` (the `<Retention>` body) and `s3:PutObjectLegalHold` (the `<LegalHold>`
+  body). AWS does not document how it counts the remaining retention days; floci counts a part
+  day as a whole one, so a Deny on retention longer than N days refuses a date a few hours past
+  N days.
+- An object creation offers its tag and Object Lock keys to each action it is checked as, its
+  `s3:PutObject` and the extra actions its settings need, and S3 offers the same keys when it
+  evaluates a bucket policy itself under `s3.enforce-auth`.
 - A `PutObject` carrying `If-Match` is authorized as `s3:GetObject` as well, and that second
   check is made without the object's tags in the context, as measured on AWS. `If-None-Match`
   needs no such permission.

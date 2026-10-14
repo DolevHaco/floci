@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.iam.ResourceArnBuilder;
+import io.github.hectorvent.floci.services.s3.S3ObjectActions;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
@@ -26,6 +27,8 @@ import java.io.InputStream;
 import java.net.URLDecoder;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -67,6 +70,11 @@ public class IamConditionContextResolver {
     public static final String EXISTING_OBJECT_TAG_PREFIX = "s3:ExistingObjectTag/";
     public static final String REQUEST_OBJECT_TAG_PREFIX = "s3:RequestObjectTag/";
     public static final String REQUEST_OBJECT_TAG_KEYS = "s3:RequestObjectTagKeys";
+    public static final String VERSION_ID = "s3:versionid";
+    public static final String OBJECT_LOCK_MODE = "s3:object-lock-mode";
+    public static final String OBJECT_LOCK_RETAIN_UNTIL_DATE = "s3:object-lock-retain-until-date";
+    public static final String OBJECT_LOCK_REMAINING_RETENTION_DAYS = "s3:object-lock-remaining-retention-days";
+    public static final String OBJECT_LOCK_LEGAL_HOLD = "s3:object-lock-legal-hold";
 
     private final Instance<DynamoDbFacade> dynamoDbFacade;
     private final Instance<Ec2Service> ec2Service;
@@ -74,7 +82,12 @@ public class IamConditionContextResolver {
     private final Instance<CloudWatchLogsService> logsService;
     private final RequestContext requestContext;
     private final EmulatorConfig config;
+    private final Clock clock;
 
+    /**
+     * The system clock, not the CDI one: Object Lock's remaining retention days has to count from the
+     * same now as S3Service, which checks retention against {@code Instant.now()}.
+     */
     @Inject
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                        Instance<Ec2Service> ec2Service,
@@ -82,12 +95,23 @@ public class IamConditionContextResolver {
                                        Instance<CloudWatchLogsService> logsService,
                                        RequestContext requestContext,
                                        EmulatorConfig config) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, requestContext, config, Clock.systemUTC());
+    }
+
+    IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                Instance<Ec2Service> ec2Service,
+                                Instance<S3Service> s3Service,
+                                Instance<CloudWatchLogsService> logsService,
+                                RequestContext requestContext,
+                                EmulatorConfig config,
+                                Clock clock) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
         this.logsService = logsService;
         this.requestContext = requestContext;
         this.config = config;
+        this.clock = clock;
     }
 
     public Map<String, List<String>> resolve(String credentialScope, String action,
@@ -214,27 +238,62 @@ public class IamConditionContextResolver {
     // ── S3 ──────────────────────────────────────────────────────────────────────
 
     private Map<String, List<String>> s3ConditionContext(String action, ContainerRequestContext ctx) {
+        Map<String, List<String>> conditions = s3ActionConditionContext(action, ctx);
+        // A version action is checked only for a request naming a version, and carries its id.
+        if (S3ObjectActions.isVersionAction(action) && ctx.getUriInfo() != null) {
+            String versionId = ctx.getUriInfo().getQueryParameters().getFirst("versionId");
+            if (versionId != null) {
+                conditions = merge(conditions, Map.of(VERSION_ID, List.of(versionId)));
+            }
+        }
+        return conditions;
+    }
+
+    private Map<String, List<String>> s3ActionConditionContext(String action, ContainerRequestContext ctx) {
         return switch (action) {
             case "s3:ListBucket" -> s3BucketListConditionContext(ctx.getUriInfo().getQueryParameters());
-            case "s3:PutBucketTagging" -> s3PutBucketTaggingConditionContext(ctx);
-            case "s3:GetBucketTagging", "s3:DeleteBucketTagging", "s3:DeleteBucket" ->
-                    s3BucketResourceTagConditionContext(ctx);
+            // DeleteBucketTagging is checked as s3:PutBucketTagging, and sends no tags of its own:
+            // what it has is the bucket's current tags, as GetBucketTagging does.
+            case "s3:PutBucketTagging" -> "DELETE".equalsIgnoreCase(ctx.getMethod())
+                    ? s3BucketResourceTagConditionContext(ctx)
+                    : s3PutBucketTaggingConditionContext(ctx);
+            case "s3:GetBucketTagging", "s3:DeleteBucket" -> s3BucketResourceTagConditionContext(ctx);
             // Object tags. Which action is given which key is what real AWS was measured to do,
             // not what reads naturally: s3:DeleteObject is given neither key, and s3:PutObject is
             // given the tags of the REQUEST only, never those of an object it is about to
             // overwrite. See S3ObjectTagConditionEnforcementIntegrationTest.
             //
-            // s3:GetObjectVersion is deliberately absent. IamActionRegistry authorizes a GET
-            // carrying ?versionId= as s3:GetObject, and IamEnforcementFilter is the only caller
-            // of resolve, so an arm for it would never be reached. The versionId is read from the
-            // request instead, below.
-            case "s3:GetObject", "s3:GetObjectTagging", "s3:GetObjectAcl",
-                 "s3:PutObjectAcl", "s3:DeleteObjectTagging" -> s3ExistingObjectTagConditionContext(ctx);
-            case "s3:PutObject" -> s3RequestObjectTagConditionContext(ctx);
-            case "s3:PutObjectTagging" -> merge(s3ExistingObjectTagConditionContext(ctx),
-                    s3PutObjectTaggingBodyConditionContext(ctx));
+            // The version actions IamActionRegistry checks for a request naming a versionId carry
+            // the key as their base actions do, per the Service Reference, as do the annotation
+            // actions, and the versionId picks whose tags are read.
+            case "s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectTagging",
+                 "s3:GetObjectVersionTagging", "s3:GetObjectAcl", "s3:GetObjectVersionAcl",
+                 "s3:PutObjectAcl", "s3:PutObjectVersionAcl", "s3:DeleteObjectTagging",
+                 "s3:DeleteObjectVersionTagging", "s3:GetObjectAnnotation", "s3:GetObjectVersionAnnotation",
+                 "s3:ListObjectAnnotations", "s3:ListObjectVersionAnnotations", "s3:PutObjectAnnotation",
+                 "s3:PutObjectVersionAnnotation", "s3:DeleteObjectAnnotation",
+                 "s3:DeleteObjectVersionAnnotation" -> s3ExistingObjectTagConditionContext(ctx);
+            // The Object Lock keys come from what the request sets: PutObject's headers, the
+            // retention and legal-hold bodies.
+            // S3Controller offers the bucket policy the same keys, from S3ObjectActions.
+            case "s3:PutObject" -> S3ObjectActions.objectCreationConditions(
+                    ctx::getHeaderString, s3RequestTagging(ctx), clock.instant());
+            case "s3:PutObjectRetention" -> {
+                String body = bodyText(ctx);
+                yield S3ObjectActions.objectLockConditions(XmlParser.extractFirst(body, "Mode", null),
+                        XmlParser.extractFirst(body, "RetainUntilDate", null), null, clock.instant());
+            }
+            case "s3:PutObjectLegalHold" -> S3ObjectActions.objectLockConditions(null, null,
+                    XmlParser.extractFirst(bodyText(ctx), "Status", null), clock.instant());
+            case "s3:PutObjectTagging", "s3:PutObjectVersionTagging" -> merge(
+                    s3ExistingObjectTagConditionContext(ctx), s3PutObjectTaggingBodyConditionContext(ctx));
             default -> null;
         };
+    }
+
+    private static String bodyText(ContainerRequestContext ctx) {
+        byte[] body = bufferEntity(ctx);
+        return body == null ? null : new String(body, StandardCharsets.UTF_8);
     }
 
     /**
@@ -274,37 +333,16 @@ public class IamConditionContextResolver {
     }
 
     /**
-     * {@code s3:RequestObjectTag/<key>} from a PutObject's {@code x-amz-tagging} header, or the
-     * query parameter where a presigner may place it. The header takes precedence, including
-     * an empty header, matching the source the S3 controller applies to the object.
+     * A PutObject's {@code x-amz-tagging}: the header, or the query parameter where a presigner may
+     * place it. The header takes precedence, including an empty header, matching the source the S3
+     * controller applies to the object.
      */
-    private Map<String, List<String>> s3RequestObjectTagConditionContext(ContainerRequestContext ctx) {
+    private static String s3RequestTagging(ContainerRequestContext ctx) {
         String header = ctx.getHeaderString("x-amz-tagging");
         if (header == null && ctx.getUriInfo() != null) {
             header = ctx.getUriInfo().getQueryParameters().getFirst("x-amz-tagging");
         }
-        if (header == null || header.isBlank()) {
-            return null;
-        }
-        Map<String, List<String>> conditions = new LinkedHashMap<>();
-        Set<String> requestedKeys = new LinkedHashSet<>();
-        for (String pair : header.split("&")) {
-            int eq = pair.indexOf('=');
-            if (eq <= 0) {
-                continue;
-            }
-            String name = urlDecode(pair.substring(0, eq));
-            String value = urlDecode(pair.substring(eq + 1));
-            if (name == null || value == null) {
-                continue;
-            }
-            conditions.put(REQUEST_OBJECT_TAG_PREFIX + name, List.of(value));
-            requestedKeys.add(name);
-        }
-        if (!requestedKeys.isEmpty()) {
-            conditions.put(REQUEST_OBJECT_TAG_KEYS, new ArrayList<>(requestedKeys));
-        }
-        return conditions.isEmpty() ? null : conditions;
+        return header;
     }
 
     /** {@code s3:RequestObjectTag/<key>} from the {@code <Tagging>} XML body of PutObjectTagging. */
@@ -334,21 +372,6 @@ public class IamConditionContextResolver {
         Map<String, List<String>> merged = new LinkedHashMap<>(a);
         merged.putAll(b);
         return merged;
-    }
-
-    /**
-     * Null for a value {@code URLDecoder} refuses, such as the {@code %zz} of a malformed
-     * {@code x-amz-tagging} header. The caller drops the pair rather than letting the
-     * {@code IllegalArgumentException} out of the filter, where it becomes a 500 in place of the
-     * 400 {@code InvalidTag} the handler returns for the same header.
-     */
-    private static String urlDecode(String value) {
-        try {
-            return URLDecoder.decode(value, StandardCharsets.UTF_8);
-        } catch (IllegalArgumentException e) {
-            LOG.debugv(e, "Undecodable tag component in the IAM condition context: {0}", value);
-            return null;
-        }
     }
 
     /** The object key of a path-style (or filter-rewritten) S3 path, null for a bucket-level one. */

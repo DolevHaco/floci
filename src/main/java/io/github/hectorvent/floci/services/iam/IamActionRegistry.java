@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.core.common.AwsProtocolClaimFilter;
 import io.github.hectorvent.floci.core.common.AwsQueryServiceResolver;
 import io.github.hectorvent.floci.core.common.ProtocolClaim;
 import io.github.hectorvent.floci.core.common.WireProtocol;
+import io.github.hectorvent.floci.services.s3.S3ObjectActions;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MediaType;
@@ -389,7 +390,10 @@ public class IamActionRegistry {
             sub("requestPayment",    "s3:GetBucketRequestPayment"),
             sub("accelerate",        "s3:GetAccelerateConfiguration"),
             sub("replication",       "s3:GetReplicationConfiguration"),
-            sub("metrics",           "s3:GetMetricsConfiguration"));
+            sub("metrics",           "s3:GetMetricsConfiguration"),
+            sub("intelligent-tiering", "s3:GetIntelligentTieringConfiguration"),
+            sub("analytics",         "s3:GetAnalyticsConfiguration"),
+            sub("inventory",         "s3:GetInventoryConfiguration"));
 
     private static final List<SubResourceAction> PUT_BUCKET_SUBRESOURCES = List.of(
             sub("notification",      "s3:PutBucketNotification"),
@@ -408,13 +412,22 @@ public class IamActionRegistry {
             sub("requestPayment",    "s3:PutBucketRequestPayment"),
             sub("accelerate",        "s3:PutAccelerateConfiguration"),
             sub("replication",       "s3:PutReplicationConfiguration"),
-            sub("metrics",           "s3:PutMetricsConfiguration"));
+            sub("metrics",           "s3:PutMetricsConfiguration"),
+            sub("intelligent-tiering", "s3:PutIntelligentTieringConfiguration"),
+            sub("analytics",         "s3:PutAnalyticsConfiguration"),
+            sub("inventory",         "s3:PutInventoryConfiguration"));
+
+    // AWS has no bucket-level multipart POST, but S3Controller serves one as a virtual-hosted upload
+    // whose key landed in the bucket position, so it is checked as the upload it runs.
+    private static final List<SubResourceAction> POST_BUCKET_SUBRESOURCES = List.of(
+            sub("uploads",           "s3:PutObject"),
+            sub("uploadId",          "s3:PutObject"));
 
     // AWS gives only DeleteBucketPolicy and DeleteBucketWebsite their own action; removing any other
     // sub-resource is authorised by the same Put* action that sets it. ?accelerate is absent because
     // S3Controller rejects DELETE on it with 405, so no mapping should claim the request.
     private static final List<SubResourceAction> DELETE_BUCKET_SUBRESOURCES = List.of(
-            sub("tagging",           "s3:DeleteBucketTagging"),
+            sub("tagging",           "s3:PutBucketTagging"),
             sub("website",           "s3:DeleteBucketWebsite"),
             sub("policy",            "s3:DeleteBucketPolicy"),
             sub("cors",              "s3:PutBucketCORS"),
@@ -423,7 +436,10 @@ public class IamActionRegistry {
             sub("publicAccessBlock", "s3:PutBucketPublicAccessBlock"),
             sub("ownershipControls", "s3:PutBucketOwnershipControls"),
             sub("replication",       "s3:PutReplicationConfiguration"),
-            sub("metrics",           "s3:PutMetricsConfiguration"));
+            sub("metrics",           "s3:PutMetricsConfiguration"),
+            sub("intelligent-tiering", "s3:PutIntelligentTieringConfiguration"),
+            sub("analytics",         "s3:PutAnalyticsConfiguration"),
+            sub("inventory",         "s3:PutInventoryConfiguration"));
 
     private static String resolveS3SubResourceAction(String method, ContainerRequestContext ctx) {
         MultivaluedMap<String, String> params = ctx.getUriInfo().getQueryParameters();
@@ -441,6 +457,7 @@ public class IamActionRegistry {
             case "GET" -> GET_BUCKET_SUBRESOURCES;
             case "PUT" -> PUT_BUCKET_SUBRESOURCES;
             case "DELETE" -> DELETE_BUCKET_SUBRESOURCES;
+            case "POST" -> POST_BUCKET_SUBRESOURCES;
             default -> List.of();
         };
         for (SubResourceAction entry : chain) {
@@ -451,23 +468,94 @@ public class IamActionRegistry {
         return null;
     }
 
+    /**
+     * The operation an object sub-resource selects, checked in the order S3Controller dispatches
+     * them: a request naming several runs the first, so it is checked as that one. A
+     * {@code versionId} selects the version action AWS checks in place of an action that has one
+     * (see {@link S3ObjectActions#forVersion}). Null where the controller falls through to the plain
+     * object operation on the current version, which the rules check.
+     */
     private static String objectSubResourceAction(String method, MultivaluedMap<String, String> params) {
-        if (params.containsKey("acl")) {
-            return switch (method) {
-                case "GET" -> "s3:GetObjectAcl";
-                case "PUT" -> "s3:PutObjectAcl";
-                default -> null;
-            };
-        }
-        if (params.containsKey("tagging")) {
-            return switch (method) {
-                case "GET" -> "s3:GetObjectTagging";
-                case "PUT" -> "s3:PutObjectTagging";
-                case "DELETE" -> "s3:DeleteObjectTagging";
-                default -> null;
-            };
-        }
-        return null;
+        String versionId = params.getFirst("versionId");
+        return switch (method) {
+            case "GET" -> {
+                if (params.containsKey("uploadId")) {
+                    yield "s3:ListMultipartUploadParts";
+                }
+                if (params.containsKey("tagging")) {
+                    yield S3ObjectActions.forVersion("s3:GetObjectTagging", versionId);
+                }
+                if (params.containsKey("annotation")) {
+                    yield S3ObjectActions.forVersion(annotationReadAction(params), versionId);
+                }
+                if (params.containsKey("retention")) {
+                    yield "s3:GetObjectRetention";
+                }
+                if (params.containsKey("legal-hold")) {
+                    yield "s3:GetObjectLegalHold";
+                }
+                if (params.containsKey("acl")) {
+                    yield S3ObjectActions.forVersion("s3:GetObjectAcl", versionId);
+                }
+                yield versionId != null ? "s3:GetObjectVersion" : null;
+            }
+            case "HEAD" -> {
+                if (params.containsKey("annotation")) {
+                    yield S3ObjectActions.forVersion(annotationReadAction(params), versionId);
+                }
+                yield versionId != null ? "s3:GetObjectVersion" : null;
+            }
+            case "PUT" -> {
+                if (params.containsKey("tagging")) {
+                    yield S3ObjectActions.forVersion("s3:PutObjectTagging", versionId);
+                }
+                if (params.containsKey("retention")) {
+                    yield "s3:PutObjectRetention";
+                }
+                if (params.containsKey("legal-hold")) {
+                    yield "s3:PutObjectLegalHold";
+                }
+                if (params.containsKey("acl")) {
+                    yield S3ObjectActions.forVersion("s3:PutObjectAcl", versionId);
+                }
+                // A PUT with an uploadId is UploadPart, which the rules check as s3:PutObject.
+                yield params.containsKey("annotation")
+                        ? S3ObjectActions.forVersion("s3:PutObjectAnnotation", versionId)
+                        : null;
+            }
+            case "DELETE" -> {
+                if (params.containsKey("tagging")) {
+                    yield S3ObjectActions.forVersion("s3:DeleteObjectTagging", versionId);
+                }
+                if (params.containsKey("annotation")) {
+                    yield S3ObjectActions.forVersion("s3:DeleteObjectAnnotation", versionId);
+                }
+                if (params.containsKey("uploadId")) {
+                    yield "s3:AbortMultipartUpload";
+                }
+                yield versionId != null ? "s3:DeleteObjectVersion" : null;
+            }
+            case "POST" -> {
+                if (params.containsKey("uploads")) {
+                    yield "s3:PutObject";
+                }
+                if (params.containsKey("restore")) {
+                    yield "s3:RestoreObject";
+                }
+                if (params.containsKey("select")) {
+                    // S3Controller selects from the version a versionId names.
+                    yield S3ObjectActions.forVersion("s3:GetObject", versionId);
+                }
+                yield params.containsKey("uploadId") ? "s3:PutObject" : null;
+            }
+            default -> null;
+        };
+    }
+
+    /** A named annotation is GetObjectAnnotation; an empty or absent name lists them, as S3Controller does. */
+    private static String annotationReadAction(MultivaluedMap<String, String> params) {
+        String name = params.getFirst("annotationName");
+        return name != null && !name.isEmpty() ? "s3:GetObjectAnnotation" : "s3:ListObjectAnnotations";
     }
 
 }
