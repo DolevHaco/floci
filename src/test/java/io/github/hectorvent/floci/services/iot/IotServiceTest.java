@@ -221,6 +221,21 @@ class IotServiceTest {
         verify(lambda).invoke(eq(REGION), eq(FUNCTION_ARN), any(), eq(InvocationType.Event));
     }
 
+    @Test
+    void publishOverHttpRunsTheRulesAndFansOutOnceExceptOnAReservedTopic() throws Exception {
+        createRule("metricsRule", sqsThenLambdaRule(null));
+        byte[] payload = "{\"v\":1}".getBytes(StandardCharsets.UTF_8);
+
+        service.publishOverHttp(TOPIC, payload, false, 0, null);
+        service.publishOverHttp("$aws/things/sensor-1/shadow/update", payload, false, 0, null);
+        service.publish(TOPIC, payload, false, 0, null, "sensor-1");
+
+        verify(broker, times(1)).publish(TOPIC, payload);
+        verify(broker, times(1)).publish(anyString(), any());
+        verify(sqs, times(2)).sendMessage(eq(QUEUE_URL), eq("{\"v\":1}"), eq(0), eq(REGION));
+        assertEquals(List.of(TOPIC, "$aws/things/sensor-1/shadow/update", TOPIC), recordedTopics());
+    }
+
     /** As AWS IoT does for rule topic filters: a wildcard first level does not match a lifecycle topic. */
     @Test
     void aRuleWhoseTopicFilterStartsWithAWildcardDoesNotFireForALifecycleTopic() throws Exception {

@@ -269,6 +269,29 @@ class IotMqttEnabledIntegrationTest {
     }
 
     @Test
+    void httpPublishIsDeliveredOnceToMqttSubscribers() throws Exception {
+        String topic = "phase/http/" + System.nanoTime();
+        byte[] payload = "over-http".getBytes(StandardCharsets.UTF_8);
+
+        try (MqttTestClient subscriber = connectMqtt("http-publish-sub")) {
+            subscriber.subscribe(topic);
+
+            given()
+                .contentType("application/octet-stream")
+                .body(payload)
+            .when()
+                .post("/topics/" + topic)
+            .then()
+                .statusCode(200);
+
+            MqttPublish received = subscriber.takePublish();
+            assertEquals(topic, received.topic());
+            assertArrayEquals(payload, received.payload());
+            subscriber.assertNoPublish();
+        }
+    }
+
+    @Test
     void publishOfTheAwsMaximumPayloadIsDelivered() throws Exception {
         String topic = "phase6/limit/" + System.nanoTime();
         byte[] payload = randomPayload(AWS_MAX_PAYLOAD);
@@ -1016,6 +1039,14 @@ class IotMqttEnabledIntegrationTest {
         MqttPublish takePublish() throws InterruptedException {
             return Optional.ofNullable(publishes.poll(2, TimeUnit.SECONDS))
                     .orElseThrow(() -> new AssertionError("No MQTT publish received"));
+        }
+
+        void assertNoPublish() throws InterruptedException {
+            MqttPublish unexpected = publishes.poll(2, TimeUnit.SECONDS);
+            if (unexpected != null) {
+                throw new AssertionError("Unexpected MQTT publish on " + unexpected.topic() + ": "
+                        + new String(unexpected.payload(), StandardCharsets.UTF_8));
+            }
         }
 
         void awaitDisconnected() throws InterruptedException {

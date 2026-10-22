@@ -1210,6 +1210,19 @@ public class IotService {
         handlePublish(topic, eventPayload, true, region, clientId, ruleRunner);
     }
 
+    /**
+     * An IoT Data {@code Publish} over HTTP: stored, recorded and run through the rules as
+     * {@link #publish} does, then delivered to the topic's MQTT subscribers, as the AWS message
+     * broker delivers HTTP and MQTT publishes alike. A reserved {@code $aws/} topic is not fanned out.
+     */
+    public void publishOverHttp(String topic, byte[] payload, boolean retain, int qos, String region) {
+        byte[] message = payload == null ? new byte[0] : payload;
+        publish(topic, message, retain, qos, region, null);
+        if (!topic.startsWith("$aws/")) {
+            mqttBrokerService.publish(topic, message);
+        }
+    }
+
     public void deleteConnection(String clientId, boolean cleanSession) {
         validateMqttClientId(clientId);
         boolean disconnected = mqttBrokerService.disconnectClient(clientId, cleanSession);
