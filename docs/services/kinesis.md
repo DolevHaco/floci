@@ -98,17 +98,7 @@ A stream's retention period (default 24 hours, `IncreaseStreamRetentionPeriod`/`
 
 ## Record Routing
 
-`PutRecord` and `PutRecords` honor `ExplicitHashKey` when it is provided. The
-value must be a decimal integer in the Kinesis hash-key space, and records are
-written to the open shard whose `HashKeyRange` contains that value.
-
-Without `ExplicitHashKey`, Floci uses the partition key's Java hash modulo the
-number of stored shards, including closed shards. If this selects a closed
-shard, it follows split and merge lineage through any closed intermediate shards
-to the first open descendant in breadth-first, stored-shard order. Writes never
-append to a closed shard or fall back to an unrelated open shard. A lineage with
-no reachable open shard fails the write. This simplified ordinary-key placement
-differs from AWS's MD5 hash-range routing.
+`PutRecord` and `PutRecords` honor `ExplicitHashKey` when it is provided. The value must be a decimal integer in the Kinesis hash-key space, and records are written to the open shard whose `HashKeyRange` contains that value. Without `ExplicitHashKey`, the partition key is mapped to a 128-bit hash key with MD5, as AWS does, and the record goes to the open shard whose `HashKeyRange` contains it. A given partition key therefore lands on the same shard as on AWS for the same shard layout, and never on a shard closed by `SplitShard`, `MergeShards` or `UpdateShardCount`.
 
 ## Shard Scaling (UpdateShardCount)
 

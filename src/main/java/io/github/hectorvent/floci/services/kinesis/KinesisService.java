@@ -20,14 +20,14 @@ import org.jboss.logging.Logger;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Comparator;
-import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -1225,58 +1225,52 @@ public class KinesisService implements ResourceProvider {
             return selectShardByExplicitHashKey(stream, explicitHashKey);
         }
 
-        // Preserve ordinary-key placement, then resolve historical parents to an open descendant.
-        // The producer holds the stream lock, shared with splitShard and mergeShards.
-        List<KinesisShard> shards = stream.getShards();
-        int index = (int) (Math.abs((long) partitionKey.hashCode()) % shards.size());
-        KinesisShard selected = shards.get(index);
-        if (!selected.isClosed()) {
-            return selected;
+        BigInteger hashKey = partitionKeyHashKey(partitionKey);
+        KinesisShard shard = soleOpenShardCovering(stream, hashKey);
+        if (shard == null) {
+            // Several open shards cover every key on a stream persisted with the full range on each shard.
+            normalizeOpenShardRanges(stream);
+            shard = soleOpenShardCovering(stream, hashKey);
         }
+        if (shard == null) {
+            throw new AwsException("InternalFailure",
+                    "No open shard covers the hash key of partition key " + partitionKey + ".", 500);
+        }
+        return shard;
+    }
 
-        List<KinesisShard> snapshot = List.copyOf(shards);
-        Map<String, List<KinesisShard>> children = new HashMap<>();
-        for (KinesisShard shard : snapshot) {
-            if (shard.getParentShardId() != null) {
-                children.computeIfAbsent(shard.getParentShardId(), ignored -> new ArrayList<>()).add(shard);
-            }
-            if (shard.getAdjacentParentShardId() != null) {
-                children.computeIfAbsent(shard.getAdjacentParentShardId(), ignored -> new ArrayList<>()).add(shard);
-            }
+    /** PutRecord's documented mapping: the MD5 digest of the partition key as an unsigned 128-bit integer. */
+    private static BigInteger partitionKeyHashKey(String partitionKey) {
+        try {
+            return new BigInteger(1, MessageDigest.getInstance("MD5")
+                    .digest(partitionKey.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("MD5 is not available", e);
         }
-        Deque<KinesisShard> pending = new ArrayDeque<>();
-        Set<String> visited = new HashSet<>();
-        pending.add(selected);
-        visited.add(selected.getShardId());
-        while (!pending.isEmpty()) {
-            KinesisShard shard = pending.removeFirst();
-            if (!shard.isClosed()) {
-                return shard;
-            }
-            for (KinesisShard child : children.getOrDefault(shard.getShardId(), List.of())) {
-                if (visited.add(child.getShardId())) {
-                    pending.addLast(child);
+    }
+
+    /** The only open shard whose hash key range holds {@code hashKey}, or null when none or several do. */
+    private static KinesisShard soleOpenShardCovering(KinesisStream stream, BigInteger hashKey) {
+        KinesisShard covering = null;
+        for (KinesisShard shard : stream.getShards()) {
+            if (!shard.isClosed() && shard.coversHashKey(hashKey)) {
+                if (covering != null) {
+                    return null;
                 }
+                covering = shard;
             }
         }
-        throw new AwsException("InvalidArgumentException",
-                "Selected shard " + selected.getShardId() + " has no open descendant.", 400);
+        return covering;
     }
 
     private KinesisShard selectShardByExplicitHashKey(KinesisStream stream, String explicitHashKey) {
         BigInteger hashKey = parseExplicitHashKey(explicitHashKey);
         return stream.getShards().stream()
                 .filter(shard -> !shard.isClosed())
-                .filter(shard -> containsHashKey(shard, hashKey))
+                .filter(shard -> shard.coversHashKey(hashKey))
                 .findFirst()
                 .orElseThrow(() -> new AwsException("InvalidArgumentException",
                         "ExplicitHashKey does not map to an open shard.", 400));
-    }
-
-    private static boolean containsHashKey(KinesisShard shard, BigInteger hashKey) {
-        BigInteger start = new BigInteger(shard.getHashKeyRange().startingHashKey());
-        BigInteger end = new BigInteger(shard.getHashKeyRange().endingHashKey());
-        return hashKey.compareTo(start) >= 0 && hashKey.compareTo(end) <= 0;
     }
 
     // Streams created before explicit-hash routing persisted the same full-span range on every

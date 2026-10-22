@@ -11,6 +11,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -33,68 +35,63 @@ class KinesisClosedShardRoutingServiceTest {
     }
 
     @Test
-    void putRecordFollowsAnOpenSplitChild() {
+    void putRecordFollowsAnOpenSplitChild() throws Exception {
         KinesisStream stream = service.createStream(STREAM, 1, REGION);
         service.putRecord(STREAM, DATA, "c", REGION);
         split(stream.getShards().getFirst());
 
-        assertOpenDestinationAndUnchangedClosedRecords(stream, "c", stream.getShards().get(1));
+        assertOpenDestinationAndUnchangedClosedRecords(stream, "c", openShardCovering(stream, "c"));
     }
 
     @Test
-    void putRecordTraversesClosedSplitChildren() {
+    void putRecordTraversesClosedSplitChildren() throws Exception {
         KinesisStream stream = splitTwoGenerations();
 
-        // "b" hashes to 98, selecting the original parent at index zero modulo seven.
-        assertOpenDestinationAndUnchangedClosedRecords(stream, "b", stream.getShards().get(3));
+        assertOpenDestinationAndUnchangedClosedRecords(stream, "b", openShardCovering(stream, "b"));
     }
 
     @ParameterizedTest
     @ValueSource(ints = {1, 2})
-    void putRecordPrefersAnOpenDirectChildOverADeeperDescendant(int closedChildIndex) {
+    void putRecordPrefersAnOpenDirectChildOverADeeperDescendant(int closedChildIndex) throws Exception {
         KinesisStream stream = service.createStream(STREAM, 1, REGION);
         split(stream.getShards().getFirst());
         split(stream.getShards().get(closedChildIndex));
 
-        // "d" selects the root modulo five, with one direct child still open.
-        assertOpenDestinationAndUnchangedClosedRecords(stream, "d", stream.getShards().get(3 - closedChildIndex));
+        // The key lands on the one open shard whose hash range holds MD5(partitionKey),
+        // whether that shard is the unsplit child or a grandchild of the split sibling.
+        assertOpenDestinationAndUnchangedClosedRecords(stream, "d", openShardCovering(stream, "d"));
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"d", "e"})
-    void putRecordTraversesEitherMergeParentThenAClosedChild(String partitionKey) {
+    void putRecordTraversesEitherMergeParentThenAClosedChild(String partitionKey) throws Exception {
         KinesisStream stream = service.createStream(STREAM, 2, REGION);
         service.mergeShards(STREAM, stream.getShards().get(0).getShardId(),
                 stream.getShards().get(1).getShardId(), REGION);
         split(stream.getShards().get(2));
 
-        // With five stored shards, these keys select each original merge parent.
-        assertOpenDestinationAndUnchangedClosedRecords(stream, partitionKey, stream.getShards().get(3));
+        assertOpenDestinationAndUnchangedClosedRecords(stream, partitionKey, openShardCovering(stream, partitionKey));
     }
 
     @Test
-    void putRecordTraversesSplitThenMergeThenSplit() {
+    void putRecordTraversesSplitThenMergeThenSplit() throws Exception {
         KinesisStream stream = service.createStream(STREAM, 1, REGION);
         split(stream.getShards().getFirst());
         service.mergeShards(STREAM, stream.getShards().get(1).getShardId(),
                 stream.getShards().get(2).getShardId(), REGION);
         split(stream.getShards().get(3));
 
-        assertOpenDestinationAndUnchangedClosedRecords(stream, "f", stream.getShards().get(4));
+        assertOpenDestinationAndUnchangedClosedRecords(stream, "f", openShardCovering(stream, "f"));
     }
 
     @Test
-    void putRecordUsesAReachableChildInsteadOfAnEarlierUnrelatedOpenShard() {
+    void putRecordUsesAReachableChildInsteadOfAnEarlierUnrelatedOpenShard() throws Exception {
         KinesisStream stream = service.createStream(STREAM, 2, REGION);
         service.putRecordWithShardId(STREAM, DATA, "d", "0", REGION);
         split(stream.getShards().getFirst());
 
-        // "d" selects the closed parent modulo four; shard one is unrelated and open.
-        assertOpenDestinationAndUnchangedClosedRecords(stream, "d", stream.getShards().get(2));
-
+        assertOpenDestinationAndUnchangedClosedRecords(stream, "d", openShardCovering(stream, "d"));
         assertEquals(1, stream.getShards().get(0).recordCount());
-        assertEquals(0, stream.getShards().get(1).recordCount());
-        assertEquals(1, stream.getShards().get(2).recordCount());
     }
 
     @Test
@@ -106,11 +103,20 @@ class KinesisClosedShardRoutingServiceTest {
     }
 
     @Test
-    void putRecordDoesNotFallBackToAnUnrelatedOpenShard() {
+    void putRecordDoesNotFallBackToAnUnrelatedOpenShard() throws Exception {
         KinesisStream stream = service.createStream(STREAM, 2, REGION);
-        stream.getShards().getFirst().setClosed(true);
+        KinesisShard closed = stream.getShards().get(0);
+        KinesisShard open = stream.getShards().get(1);
+        closed.setClosed(true);
 
-        assertNoDestination(stream, "b");
+        // A key in the closed shard's range is rejected. It is not written to the other open shard.
+        assertNoDestination(stream, partitionKeyInRange(closed));
+        assertEquals(0, open.recordCount());
+
+        String openKey = partitionKeyInRange(open);
+        KinesisService.PutRecordResult result = service.putRecordWithShardId(STREAM, DATA, openKey, REGION);
+        assertEquals(open.getShardId(), result.shardId());
+        assertEquals(0, closed.recordCount());
     }
 
     @Test
@@ -188,8 +194,40 @@ class KinesisClosedShardRoutingServiceTest {
     private void assertNoDestination(KinesisStream stream, String partitionKey) {
         AwsException error = assertThrows(AwsException.class,
                 () -> service.putRecordWithShardId(STREAM, DATA, partitionKey, REGION));
-        assertEquals("InvalidArgumentException", error.getErrorCode());
-        assertEquals(400, error.getHttpStatus());
+        assertEquals("InternalFailure", error.getErrorCode());
+        assertEquals(500, error.getHttpStatus());
         assertTrue(stream.getShards().stream().allMatch(shard -> shard.recordCount() == 0));
+    }
+
+    private static KinesisShard openShardCovering(KinesisStream stream, String partitionKey) throws Exception {
+        BigInteger hashKey = md5HashKey(partitionKey);
+        List<KinesisShard> covering = stream.getShards().stream()
+                .filter(shard -> !shard.isClosed())
+                .filter(shard -> covers(shard, hashKey))
+                .toList();
+        assertEquals(1, covering.size(), partitionKey);
+        return covering.getFirst();
+    }
+
+    private static String partitionKeyInRange(KinesisShard shard) throws Exception {
+        for (int i = 0; i < 10_000; i++) {
+            String key = "range-" + i;
+            if (covers(shard, md5HashKey(key))) {
+                return key;
+            }
+        }
+        fail("no partition key fell in " + shard.getShardId());
+        return "";
+    }
+
+    private static boolean covers(KinesisShard shard, BigInteger hashKey) {
+        BigInteger start = new BigInteger(shard.getHashKeyRange().startingHashKey());
+        BigInteger end = new BigInteger(shard.getHashKeyRange().endingHashKey());
+        return hashKey.compareTo(start) >= 0 && hashKey.compareTo(end) <= 0;
+    }
+
+    private static BigInteger md5HashKey(String partitionKey) throws Exception {
+        return new BigInteger(1, MessageDigest.getInstance("MD5")
+                .digest(partitionKey.getBytes(StandardCharsets.UTF_8)));
     }
 }
