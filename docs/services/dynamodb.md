@@ -273,7 +273,7 @@ region is rejected.
 
 Under `persistent` storage mode, single-item writes (`PutItem`, `UpdateItem`, `DeleteItem`) flush the affected table to disk synchronously. Batch operations (`BatchWriteItem` and `TransactWriteItems`) batch disk flushes per affected table across the entire operation, rather than flushing on every individual item mutation.
 
-Concurrent writes to the same table store its snapshot one at a time, so in every storage mode the stored table holds every write that has returned and a deleted table's items are not stored again.
+Concurrent writes to the same table copy it in parallel but never store an older copy over a newer one, so in every storage mode the stored table holds every write that has returned and a deleted table's items are not stored again.
 
 For write-heavy workloads under persistent setups, configuring `FLOCI_STORAGE_SERVICES_DYNAMODB_MODE=wal` or `hybrid` is recommended to avoid full-file rewrites on each write operation:
 - `wal`: Uses an append-only write-ahead log with background compaction.

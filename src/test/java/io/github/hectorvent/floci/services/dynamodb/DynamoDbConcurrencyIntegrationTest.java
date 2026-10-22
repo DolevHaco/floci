@@ -985,6 +985,37 @@ class DynamoDbConcurrencyIntegrationTest {
     }
 
     @RepeatedTest(REPEATS)
+    void concurrent_putItem_store_holds_every_acknowledged_write() throws Exception {
+        StorageBackend<String, TableDefinition> tableStore = new InMemoryStorage<>();
+        StorageBackend<String, Map<String, JsonNode>> itemStore = new InMemoryStorage<>();
+        RegionResolver regionResolver = new RegionResolver("us-east-1", "000000000000");
+        service = new DynamoDbService(tableStore, itemStore, regionResolver);
+        createCounterTable("us-east-1");
+        AtomicInteger idSource = new AtomicInteger();
+        List<String> missingAfterAck = Collections.synchronizedList(new ArrayList<>());
+
+        List<Throwable> errors = runConcurrently(THREADS, () -> {
+            for (int i = 0; i < OPS_PER_SCENARIO; i++) {
+                String pk = "acked-" + idSource.getAndIncrement();
+                service.putItem("Counters", itemWithPk(pk), "us-east-1");
+                // Once the write has returned, every table copy stored from then on must hold it.
+                if (!itemStore.get("us-east-1::Counters").orElseThrow().containsKey(pk)) {
+                    missingAfterAck.add(pk);
+                }
+            }
+        });
+
+        assertTrue(errors.isEmpty(), () -> "unexpected errors: " + errors);
+        assertTrue(missingAfterAck.isEmpty(),
+                () -> "an older copy of the table was stored over a newer one, dropping: " + missingAfterAck);
+        assertEquals(THREADS * OPS_PER_SCENARIO, itemStore.get("us-east-1::Counters").orElseThrow().size());
+        DynamoDbService restarted = new DynamoDbService(tableStore, itemStore, regionResolver);
+        for (int i = 0; i < THREADS * OPS_PER_SCENARIO; i++) {
+            assertNotNull(restarted.getItem("Counters", pkKey("acked-" + i), "us-east-1"), "acked-" + i);
+        }
+    }
+
+    @RepeatedTest(REPEATS)
     void putItem_persist_racing_deleteTable_does_not_bring_the_items_back() throws Exception {
         StorageBackend<String, TableDefinition> tableStore = new InMemoryStorage<>();
         ParkingItemStore itemStore = new ParkingItemStore();

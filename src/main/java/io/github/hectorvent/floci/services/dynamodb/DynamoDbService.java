@@ -84,6 +84,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -126,6 +127,17 @@ public class DynamoDbService {
     // Items stored per table: storageKey -> Map<itemKey, item>
     // itemKey is "pk" or "pk#sk" depending on table schema
     private final ConcurrentHashMap<String, ConcurrentSkipListMap<String, JsonNode>> itemsByTable = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, SnapshotOrder> snapshotOrders = new ConcurrentHashMap<>();
+
+    private static final class SnapshotOrder {
+        private final ConcurrentSkipListMap<String, JsonNode> items;
+        private final AtomicLong taken = new AtomicLong();
+        private final AtomicLong stored = new AtomicLong();
+
+        private SnapshotOrder(ConcurrentSkipListMap<String, JsonNode> items) {
+            this.items = items;
+        }
+    }
 
     // Per-item locks: storageKey -> itemKey -> ReentrantLock. Locks are created lazily
     // on first access and cleared with the table (see deleteTable); transactWriteItems
@@ -339,6 +351,7 @@ public class DynamoDbService {
     /** Emulator reset: drops the in-process item cache, locks and idempotency tokens, and stream state. */
     public void clearProcessState() {
         itemsByTable.clear();
+        snapshotOrders.clear();
         itemLocks.clear();
         txIdempotency.clear();
         pointInTimeRecovery.clear();
@@ -410,17 +423,45 @@ public class DynamoDbService {
 
     private void persistItems(String storageKey) {
         if (itemStore == null) return;
-        // Copying and storing the table under its itemsByTable entry's lock keeps a slower writer
-        // from storing an older copy over a newer one, and holds off DeleteTable, which removes
-        // the entry before it deletes the stored items. The TTL sweep persists the same way.
-        ConcurrentSkipListMap<String, JsonNode> persisted = itemsByTable.computeIfPresent(
-                scopedItemsKey(storageKey), (key, items) -> {
-                    itemStore.put(storageKey, new HashMap<>(items));
-                    return items;
-                });
-        if (persisted == null) {
+        String scopedKey = scopedItemsKey(storageKey);
+        ConcurrentSkipListMap<String, JsonNode> items = itemsByTable.get(scopedKey);
+        if (items == null) {
             itemStore.delete(storageKey);
+            return;
         }
+        storeSnapshot(scopedKey, items, snapshot -> itemStore.put(storageKey, snapshot));
+    }
+
+    // A copy numbered n holds every write finished before n was taken, so storing only higher numbers keeps them all.
+    private void storeSnapshot(String scopedKey, ConcurrentSkipListMap<String, JsonNode> items,
+                               Consumer<Map<String, JsonNode>> store) {
+        if (itemStore == null) return;
+        SnapshotOrder order = snapshotOrder(scopedKey, items);
+        if (order == null) {
+            return;
+        }
+        long number = order.taken.incrementAndGet();
+        Map<String, JsonNode> snapshot = new HashMap<>(items);
+        itemsByTable.computeIfPresent(scopedKey, (key, live) -> {
+            if (live == items && number > order.stored.get()) {
+                store.accept(snapshot);
+                order.stored.set(number);
+            }
+            return live;
+        });
+    }
+
+    private SnapshotOrder snapshotOrder(String scopedKey, ConcurrentSkipListMap<String, JsonNode> items) {
+        SnapshotOrder order = snapshotOrders.get(scopedKey);
+        if (order == null || order.items != items) {
+            order = snapshotOrders.compute(scopedKey, (key, current) -> {
+                if (current != null && current.items == items) {
+                    return current;
+                }
+                return itemsByTable.get(key) == items ? new SnapshotOrder(items) : current;
+            });
+        }
+        return order != null && order.items == items ? order : null;
     }
 
     /**
@@ -1007,7 +1048,9 @@ public class DynamoDbService {
         table.setPointInTimeRecoveryEnabled(false);
         pointInTimeRecovery.drop(regionResolver.getAccountId(), storageKey);
         tableStore.delete(storageKey);
-        itemsByTable.remove(scopedItemsKey(storageKey));
+        ConcurrentSkipListMap<String, JsonNode> removedItems = itemsByTable.remove(scopedItemsKey(storageKey));
+        snapshotOrders.computeIfPresent(scopedItemsKey(storageKey),
+                (key, order) -> order.items == removedItems ? null : order);
         itemLocks.remove(scopedItemsKey(storageKey));
         if (itemStore != null) {
             itemStore.delete(storageKey);
@@ -3232,14 +3275,10 @@ public class DynamoDbService {
             }
             if (deletedForTable > 0 && entryStore == null) {
                 // A DeleteTable during the loop detached this map; writing it back would revive its items.
-                // Persisting under the entry's lock holds off DeleteTable, which removes the entry before
-                // it deletes the stored items.
-                itemsByTable.computeIfPresent(scan.rawKey(), (key, live) -> {
-                    if (live == items) {
-                        persistItemsForAccount(scan.accountId(), scan.storageKey(), items);
-                    }
-                    return live;
-                });
+                // The copy is taken outside the entry lock and stored only while this map is still the
+                // live one, so a deleted table's items are not written again.
+                storeSnapshot(scan.rawKey(), items,
+                        snapshot -> persistItemsForAccount(scan.accountId(), scan.storageKey(), snapshot));
             }
             totalDeleted += deletedForTable;
         }
@@ -3249,12 +3288,12 @@ public class DynamoDbService {
     }
 
     /** Like {@link #persistItems}, but for callers with no ambient request account to rely on. */
-    private void persistItemsForAccount(String accountId, String storageKey, Map<String, JsonNode> items) {
+    private void persistItemsForAccount(String accountId, String storageKey, Map<String, JsonNode> snapshot) {
         if (itemStore == null) return;
         if (accountId != null && itemStore instanceof AccountAwareStorageBackend<Map<String, JsonNode>> aware) {
-            aware.putForAccount(accountId, storageKey, new HashMap<>(items));
+            aware.putForAccount(accountId, storageKey, snapshot);
         } else {
-            itemStore.put(storageKey, new HashMap<>(items));
+            itemStore.put(storageKey, snapshot);
         }
     }
 
