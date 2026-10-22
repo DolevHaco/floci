@@ -11,12 +11,16 @@ import io.github.hectorvent.floci.testing.TestImages;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
 import jakarta.inject.Inject;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
+import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -31,6 +35,7 @@ import static io.restassured.RestAssured.given;
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -86,6 +91,39 @@ class SageMakerDockerIntegrationTest {
                 .extract().path("ModelArtifacts.S3ModelArtifacts");
         S3Uri uri = S3Uri.parse(artifact);
         assertNotNull(s3Service.getObject(uri.bucket(), uri.key()).getData());
+    }
+
+    @Test
+    void trainingJobPastMaxRuntimeIsStoppedWithTheModelItSavedOnSigterm() throws Exception {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String bucket = "sm-maxrt-" + suffix;
+        s3Service.createBucket(bucket, "us-east-1");
+        String job = "sm-maxrt-" + suffix;
+        post("SageMaker.CreateTrainingJob", """
+                {
+                  "TrainingJobName":"%s",
+                  "AlgorithmSpecification":{
+                    "TrainingImage":"%s",
+                    "ContainerEntrypoint":["/bin/sh","-c"],
+                    "ContainerArguments":["trap 'mkdir -p /opt/ml/model && echo saved > /opt/ml/model/model.txt; exit 0' TERM; while true; do sleep 1 & wait $!; done"]
+                  },
+                  "OutputDataConfig":{"S3OutputPath":"s3://%s/output"},
+                  "ResourceConfig":{"InstanceType":"ml.m5.large","InstanceCount":1,"VolumeSizeInGB":1},
+                  "StoppingCondition":{"MaxRuntimeInSeconds":2}
+                }
+                """.formatted(job, TestImages.BUSYBOX, bucket)).then().statusCode(200);
+
+        String status = awaitTerminalStatus("Stopped", () -> post("SageMaker.DescribeTrainingJob",
+                "{\"TrainingJobName\":\"%s\"}".formatted(job)).then().statusCode(200).extract().path("TrainingJobStatus"));
+        assertEquals("Stopped", status, () -> post("SageMaker.DescribeTrainingJob",
+                "{\"TrainingJobName\":\"%s\"}".formatted(job)).then().extract().path("FailureReason"));
+        String artifact = post("SageMaker.DescribeTrainingJob", "{\"TrainingJobName\":\"%s\"}".formatted(job))
+                .then().statusCode(200)
+                .body("SecondaryStatus", equalTo("MaxRuntimeExceeded"))
+                .body("FailureReason", nullValue())
+                .extract().path("ModelArtifacts.S3ModelArtifacts");
+        S3Uri uri = S3Uri.parse(artifact);
+        assertEquals("saved\n", modelFile(s3Service.getObject(uri.bucket(), uri.key()).getData(), "model.txt"));
     }
 
     @Test
@@ -273,6 +311,19 @@ class SageMakerDockerIntegrationTest {
         public void close() throws IOException {
             events.close();
         }
+    }
+
+    private static String modelFile(byte[] modelTarGz, String name) throws IOException {
+        try (TarArchiveInputStream tar = new TarArchiveInputStream(
+                new GzipCompressorInputStream(new ByteArrayInputStream(modelTarGz)))) {
+            TarArchiveEntry entry;
+            while ((entry = tar.getNextEntry()) != null) {
+                if (entry.getName().equals(name)) {
+                    return new String(tar.readAllBytes(), StandardCharsets.UTF_8);
+                }
+            }
+        }
+        throw new AssertionError(name + " is not in the model archive");
     }
 
     private void awaitContainerRunning(String nameFragment) {

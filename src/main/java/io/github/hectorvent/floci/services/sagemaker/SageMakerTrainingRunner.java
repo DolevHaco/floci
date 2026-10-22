@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.sagemaker;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.exception.NotModifiedException;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.core.command.LogContainerResultCallback;
 import io.github.hectorvent.floci.config.EmulatorConfig;
@@ -47,6 +48,8 @@ import java.util.concurrent.TimeUnit;
 public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
     private static final Logger LOG = Logger.getLogger(SageMakerTrainingRunner.class);
     private static final String LOG_GROUP = "/aws/sagemaker/TrainingJobs";
+    // StoppingCondition: past MaxRuntimeInSeconds the algorithm gets SIGTERM and 120 seconds to save its model.
+    private static final int MAX_RUNTIME_STOP_GRACE_SECONDS = 120;
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
@@ -129,10 +132,18 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
                 return;
             }
             if (exit == null) {
+                // SageMaker sends SIGTERM and waits so the algorithm can save its model, then uploads
+                // whatever it saved: the container must outlive the stop for that upload.
+                try {
+                    lifecycleManager.getDockerClient().stopContainerCmd(containerId)
+                            .withTimeout(MAX_RUNTIME_STOP_GRACE_SECONDS).exec();
+                } catch (NotModifiedException alreadyStopped) {
+                    LOG.debugv("SageMaker training container {0} exited before its runtime stop (304)", containerId);
+                }
+                job.modelArtifactsS3ModelArtifacts = uploadModelArtifacts(containerId, job);
                 lifecycleManager.stopAndRemove(containerId, logs);
-                job.trainingJobStatus = "Failed";
-                job.secondaryStatus = "Failed";
-                job.failureReason = "Training job exceeded StoppingCondition.MaxRuntimeInSeconds";
+                job.trainingJobStatus = "Stopped";
+                job.secondaryStatus = "MaxRuntimeExceeded";
             } else if (exit == 0) {
                 job.modelArtifactsS3ModelArtifacts = uploadModelArtifacts(containerId, job);
                 lifecycleManager.stopAndRemove(containerId, logs);

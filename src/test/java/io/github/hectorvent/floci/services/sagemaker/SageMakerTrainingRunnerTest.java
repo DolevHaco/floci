@@ -2,9 +2,12 @@ package io.github.hectorvent.floci.services.sagemaker;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.command.CopyArchiveFromContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.StopContainerCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.exception.NotModifiedException;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -16,9 +19,16 @@ import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.sagemaker.model.SageMakerEntities.TrainingJobResource;
 import io.github.hectorvent.floci.testing.DockerArchiveUploadFixture;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -31,10 +41,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -50,6 +64,7 @@ class SageMakerTrainingRunnerTest {
     private final DockerClient docker = mock(DockerClient.class);
     private final ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
     private final ContainerLogStreamer logStreamer = mock(ContainerLogStreamer.class);
+    private final S3Service s3 = mock(S3Service.class);
 
     @Test
     void teardownStopsThePoolAndAfterResetRestoresIt() {
@@ -187,6 +202,75 @@ class SageMakerTrainingRunnerTest {
         runner.stopManagedContainers();
     }
 
+    @Test
+    void exceedingMaxRuntimeStopsTheJobAndKeepsItsModelArtifacts() throws Exception {
+        StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
+        CopyArchiveFromContainerCmd copyModel = mock(CopyArchiveFromContainerCmd.class);
+        SageMakerTrainingRunner runner = dockerBackedRunner();
+
+        TrainingJobResource job = runPastMaxRuntime(runner, stop, copyModel);
+
+        assertEquals("Stopped", job.trainingJobStatus);
+        assertEquals("MaxRuntimeExceeded", job.secondaryStatus);
+        assertNull(job.failureReason);
+        assertEquals("s3://bucket/output/slow/output/model.tar.gz", job.modelArtifactsS3ModelArtifacts);
+        // SIGTERM with SageMaker's 120 s window to save the model, then the upload, and only then removal.
+        InOrder order = inOrder(stop, copyModel, s3, lifecycle);
+        order.verify(stop).withTimeout(120);
+        order.verify(stop).exec();
+        order.verify(copyModel).exec();
+        order.verify(s3).putObject(eq("bucket"), eq("output/slow/output/model.tar.gz"), any(byte[].class),
+                eq("application/x-tar"), eq(Map.of()));
+        order.verify(lifecycle).stopAndRemove("container", null);
+        runner.stopManagedContainers();
+    }
+
+    @Test
+    void aContainerThatExitsAsItsRuntimeRunsOutStillKeepsItsModelArtifacts() throws Exception {
+        StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
+        when(stop.exec()).thenThrow(new NotModifiedException("Container already stopped"));
+        SageMakerTrainingRunner runner = dockerBackedRunner();
+
+        TrainingJobResource job = runPastMaxRuntime(runner, stop, mock(CopyArchiveFromContainerCmd.class));
+
+        assertEquals("Stopped", job.trainingJobStatus);
+        assertEquals("MaxRuntimeExceeded", job.secondaryStatus);
+        assertNull(job.failureReason);
+        assertEquals("s3://bucket/output/slow/output/model.tar.gz", job.modelArtifactsS3ModelArtifacts);
+        runner.stopManagedContainers();
+    }
+
+    /** Runs a job whose container is still running when its one-second MaxRuntimeInSeconds is up. */
+    private TrainingJobResource runPastMaxRuntime(SageMakerTrainingRunner runner, StopContainerCmd stop,
+                                                  CopyArchiveFromContainerCmd copyModel) throws Exception {
+        inspectReports(new AtomicBoolean(true), 0);
+        when(docker.stopContainerCmd("container")).thenReturn(stop);
+        when(docker.copyArchiveFromContainerCmd("container", "/opt/ml/model")).thenReturn(copyModel);
+        when(copyModel.exec()).thenReturn(new ByteArrayInputStream(tar("model/model.txt", "saved on SIGTERM")));
+        SageMakerService service = mock(SageMakerService.class);
+        Semaphore reports = reportsOf(service);
+        TrainingJobResource job = job("slow", "000000000000", "us-east-1");
+        job.stoppingCondition = Map.of("MaxRuntimeInSeconds", 1);
+
+        runner.runAsync(job, service, 0);
+
+        assertTrue(reports.tryAcquire(2, 10, TimeUnit.SECONDS));
+        return job;
+    }
+
+    private static byte[] tar(String name, String content) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try (TarArchiveOutputStream tar = new TarArchiveOutputStream(out)) {
+            byte[] data = content.getBytes(StandardCharsets.UTF_8);
+            TarArchiveEntry entry = new TarArchiveEntry(name);
+            entry.setSize(data.length);
+            tar.putArchiveEntry(entry);
+            tar.write(data);
+            tar.closeArchiveEntry();
+        }
+        return out.toByteArray();
+    }
+
     private static Semaphore reportsOf(SageMakerService service) {
         Semaphore reports = new Semaphore(0);
         doAnswer(invocation -> {
@@ -227,7 +311,7 @@ class SageMakerTrainingRunnerTest {
         when(lifecycle.getDockerClient()).thenReturn(docker);
         ContainerBuilder builder = new ContainerBuilder(config, mock(DockerHostResolver.class), mock(EmbeddedDnsServer.class));
         return new SageMakerTrainingRunner(builder, lifecycle, logStreamer, config, mock(ContainerDetector.class),
-                mock(S3Service.class), new ObjectMapper(), mock(SageMakerGpuResolver.class));
+                s3, new ObjectMapper(), mock(SageMakerGpuResolver.class));
     }
 
     private static TrainingJobResource job(String name, String accountId, String region) {

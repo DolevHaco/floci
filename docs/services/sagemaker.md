@@ -46,6 +46,8 @@ Containers are named `floci-aws-sagemaker-endpoint-<account>-<region>-<name>` an
 
 `CreateTrainingJob` starts `AlgorithmSpecification.TrainingImage` with command `train` unless `ContainerEntrypoint`/`ContainerArguments` are supplied. Floci writes SageMaker config files under `/opt/ml/input/config`, downloads every object under each channel's `S3Uri` prefix into `/opt/ml/input/data/<channel>` (keeping the folder structure below the prefix and skipping zero-byte folder-marker keys that end in `/`), waits for container exit, and uploads `/opt/ml/model` as `model.tar.gz` under `OutputDataConfig.S3OutputPath/<TrainingJobName>/output/`. Channel downloads, the artifact upload, and the `/aws/sagemaker/TrainingJobs` log stream use the account that created the job. If the training container is removed by anything other than `StopTrainingJob` before it exits, the job fails with `Training container was removed before it exited` rather than a made-up exit code.
 
+A container still running when `StoppingCondition.MaxRuntimeInSeconds` elapses receives `SIGTERM` and up to 120 seconds to save its model, as on AWS. Whatever it wrote to `/opt/ml/model` is uploaded as `model.tar.gz`, and the job ends `Stopped` with `SecondaryStatus` `MaxRuntimeExceeded` and no `FailureReason`.
+
 ## GPU-backed training
 
 On AWS, `ResourceConfig.InstanceType` *is* the hardware: `ml.g5.xlarge` provisions a machine that physically has one A10G. Floci has one host with whatever cards it has, so a GPU instance type is served by substituting a local device. That substitution is off by default and the SDK request is unchanged either way.
