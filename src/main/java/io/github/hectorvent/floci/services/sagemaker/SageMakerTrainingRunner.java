@@ -15,7 +15,6 @@ import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
-import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
@@ -60,10 +59,10 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
     // Replaced by afterReset() after a state reset, whose container teardown shuts this pool down.
     private volatile ExecutorService executor = Executors.newCachedThreadPool();
     private final ConcurrentHashMap<String, String> containers = new ConcurrentHashMap<>();
-    // Names a stop that stop() has already committed to the store as "Stopped": run()'s exit-code
+    // Keys a stop that stop() has already committed to the store as "Stopped": run()'s exit-code
     // handling checks this before persisting, since a stop races the removal of the very container
-    // waitForExit() is polling, and the container disappearing (NotFoundException, exit code 1)
-    // must not be relabeled a training failure.
+    // waitForExit() is polling, and the container disappearing must not be relabeled a training
+    // failure.
     private final Set<String> stopRequested = ConcurrentHashMap.newKeySet();
 
     @Inject
@@ -90,11 +89,13 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
     }
 
     private void run(TrainingJobResource job, SageMakerService service, long backoffMillis) {
+        String key = key(job);
         String containerId = null;
         Closeable logs = null;
         try {
             String image = SageMakerEndpointManager.string(job.algorithmSpecification.get("TrainingImage"));
-            String name = ContainerStorageHelper.dockerName(config, "sagemaker-training-" + job.trainingJobName);
+            String name = SageMakerEndpointManager.containerName(config, "training", job.accountId, job.region,
+                    job.trainingJobName);
             lifecycleManager.removeIfExists(name);
             ContainerBuilder.Builder builder = containerBuilder.newContainer(image)
                     .withName(name)
@@ -110,7 +111,7 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
             gpuResolver.applyTo(builder, instanceType(job), instanceCount(job));
             ContainerSpec spec = builder.build();
             containerId = lifecycleManager.create(spec);
-            containers.put(job.trainingJobName, containerId);
+            containers.put(key, containerId);
             job.containerId = containerId;
             copyTrainingInput(containerId, job, backoffMillis);
             lifecycleManager.startCreated(containerId, spec);
@@ -120,11 +121,11 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
             logs = logStreamer.attachForAccount(job.accountId, containerId, LOG_GROUP, job.trainingJobName + "/algo-1",
                     job.region, "sagemaker:" + job.trainingJobName);
             Integer exit = waitForExit(containerId, timeout(job));
-            if (stopRequested.remove(job.trainingJobName)) {
+            if (stopRequested.remove(key)) {
                 // stop() already persisted Stopped and is tearing the container down itself;
                 // whatever exit code we just observed (or failed to) is a side effect of that,
                 // not a real outcome to report.
-                containers.remove(job.trainingJobName);
+                containers.remove(key);
                 return;
             }
             if (exit == null) {
@@ -143,19 +144,19 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
                 job.trainingJobStatus = "Failed";
                 job.secondaryStatus = "Failed";
             }
-            containers.remove(job.trainingJobName);
+            containers.remove(key);
             job.trainingEndTime = System.currentTimeMillis();
             service.updateTrainingJob(job);
         } catch (Exception e) {
-            if (stopRequested.remove(job.trainingJobName)) {
-                containers.remove(job.trainingJobName);
+            if (stopRequested.remove(key)) {
+                containers.remove(key);
                 return;
             }
             LOG.warnv("SageMaker training job {0} failed: {1}", job.trainingJobName, e.getMessage());
             if (containerId != null) {
                 lifecycleManager.stopAndRemove(containerId, logs);
             }
-            containers.remove(job.trainingJobName);
+            containers.remove(key);
             job.trainingJobStatus = "Failed";
             job.secondaryStatus = "Failed";
             job.failureReason = e.getMessage();
@@ -169,11 +170,15 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
     }
 
     public void stop(TrainingJobResource job) {
-        stopRequested.add(job.trainingJobName);
-        String id = job.containerId != null ? job.containerId : containers.remove(job.trainingJobName);
+        stopRequested.add(key(job));
+        String id = job.containerId != null ? job.containerId : containers.remove(key(job));
         if (id != null) {
             lifecycleManager.stopAndRemove(id, null);
         }
+    }
+
+    private static String key(TrainingJobResource job) {
+        return SageMakerEndpointManager.resourceKey(job.accountId, job.region, job.trainingJobName);
     }
 
     @Override
@@ -339,7 +344,7 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
             Long exit = inspect.getState().getExitCodeLong();
             return exit == null ? 0 : exit.intValue();
         } catch (NotFoundException e) {
-            return 1;
+            throw new IllegalStateException("Training container was removed before it exited", e);
         }
     }
 
