@@ -149,6 +149,32 @@ class SageMakerDockerIntegrationTest {
     }
 
     @Test
+    void containerClientErrorIsReturnedAsModelError() throws Exception {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String model = "sm-4xx-model-" + suffix;
+        String cfg = "sm-4xx-cfg-" + suffix;
+        String endpoint = "sm-4xx-endpoint-" + suffix;
+        String script = "trap 'exit 0' TERM; cat > /server.py <<'PY'\nfrom http.server import BaseHTTPRequestHandler,HTTPServer\nclass H(BaseHTTPRequestHandler):\n def do_GET(self):\n  self.send_response(200 if self.path == '/ping' else 404); self.end_headers()\n def do_POST(self):\n  n=int(self.headers.get('content-length','0')); self.rfile.read(n); b=b'bad input'; self.send_response(400); self.send_header('Content-Type','text/plain'); self.send_header('Content-Length',str(len(b))); self.end_headers(); self.wfile.write(b)\nHTTPServer(('0.0.0.0',8080),H).serve_forever()\nPY\npython /server.py & wait $!";
+        post("SageMaker.CreateModel", """
+                {"ModelName":"%s","PrimaryContainer":{"Image":"%s","ContainerEntrypoint":["/bin/sh","-c"],"ContainerArguments":[%s]}}
+                """.formatted(model, TestImages.PYTHON_ALPINE, json(script))).then().statusCode(200);
+        post("SageMaker.CreateEndpointConfig", """
+                {"EndpointConfigName":"%s","ProductionVariants":[{"VariantName":"AllTraffic","ModelName":"%s","InitialInstanceCount":1,"InstanceType":"ml.t2.medium","InitialVariantWeight":1.0}]}
+                """.formatted(cfg, model)).then().statusCode(200);
+        post("SageMaker.CreateEndpoint", "{\"EndpointName\":\"%s\",\"EndpointConfigName\":\"%s\"}".formatted(endpoint, cfg))
+                .then().statusCode(200);
+        waitForEndpoint(endpoint, "InService");
+        given().header("Authorization", "AWS4-HMAC-SHA256 Credential=test/20260205/us-east-1/runtime.sagemaker/aws4_request")
+                .contentType("text/plain").body("hello")
+                .when().post("/endpoints/%s/invocations".formatted(endpoint))
+                .then().statusCode(424)
+                .body("__type", equalTo("ModelError"))
+                .body("OriginalStatusCode", equalTo(400))
+                .body("OriginalMessage", equalTo("bad input"));
+        post("SageMaker.DeleteEndpoint", "{\"EndpointName\":\"%s\"}".formatted(endpoint)).then().statusCode(200);
+    }
+
+    @Test
     void stoppingATrainingJobDoesNotGetRelabeledFailed() throws Exception {
         String suffix = Long.toString(System.nanoTime(), 36);
         String bucket = "sm-stop-" + suffix;
