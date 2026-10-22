@@ -723,6 +723,41 @@ class S3ServiceTest {
     }
 
     @Test
+    void completeMultipartUploadRechecksIfNoneMatchWhenItStoresTheObject() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+        MultipartUpload upload = s3Service.initiateMultipartUpload("test-bucket", "k.bin", "application/octet-stream");
+        s3Service.uploadPart("test-bucket", "k.bin", upload.getUploadId(), 1, "part".getBytes(StandardCharsets.UTF_8));
+        s3Service.putObject("test-bucket", "k.bin", "winner".getBytes(StandardCharsets.UTF_8), "text/plain", Map.of());
+
+        S3PreconditionFailedException error = assertThrows(S3PreconditionFailedException.class,
+                () -> s3Service.completeMultipartUpload("test-bucket", "k.bin", upload.getUploadId(), List.of(1),
+                        Map.of(), Map.of(), null, null, null, null, "*"));
+
+        assertEquals("PreconditionFailed", error.getErrorCode());
+        assertArrayEquals("winner".getBytes(StandardCharsets.UTF_8),
+                s3Service.getObject("test-bucket", "k.bin").getData());
+        assertEquals(1, s3Service.listParts("test-bucket", "k.bin", upload.getUploadId()).getParts().size());
+    }
+
+    @Test
+    void completeMultipartUploadRechecksIfMatchWhenItStoresTheObject() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+        S3Object first = s3Service.putObject("test-bucket", "k.bin", "first".getBytes(StandardCharsets.UTF_8),
+                "text/plain", Map.of());
+        MultipartUpload upload = s3Service.initiateMultipartUpload("test-bucket", "k.bin", "application/octet-stream");
+        s3Service.uploadPart("test-bucket", "k.bin", upload.getUploadId(), 1, "part".getBytes(StandardCharsets.UTF_8));
+        s3Service.putObject("test-bucket", "k.bin", "second".getBytes(StandardCharsets.UTF_8), "text/plain", Map.of());
+
+        assertThrows(S3PreconditionFailedException.class,
+                () -> s3Service.completeMultipartUpload("test-bucket", "k.bin", upload.getUploadId(), List.of(1),
+                        Map.of(), Map.of(), null, null, null, first.getETag(), null));
+
+        assertArrayEquals("second".getBytes(StandardCharsets.UTF_8),
+                s3Service.getObject("test-bucket", "k.bin").getData());
+        assertEquals(1, s3Service.listParts("test-bucket", "k.bin", upload.getUploadId()).getParts().size());
+    }
+
+    @Test
     void putObjectTriggersLambdaNotificationWhenKeyMatches() {
         RecordingLambdaInvoker lambdaInvoker = new RecordingLambdaInvoker();
         RegionResolver regionResolver = new RegionResolver("us-east-1", "000000000000");

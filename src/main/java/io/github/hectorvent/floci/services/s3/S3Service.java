@@ -5020,8 +5020,10 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     /**
-     * {@code ifMatch} and {@code ifNoneMatch} are judged by storeObject under the bucket's monitor,
-     * together with the write, so concurrent conditional completions on one key cannot all succeed.
+     * Completes an upload whose {@code If-Match} / {@code If-None-Match} conditions are rechecked under
+     * the bucket lock as the object is stored, as for PutObject. {@code storeObject} judges them together
+     * with the write, so of two conditional completions the first to finish wins and the other fails with
+     * 412, leaving its upload in place for a retry or an abort.
      */
     public S3Object completeMultipartUpload(String bucket, String key, String uploadId, List<Integer> partNumbers,
                                             Map<Integer, String> partETags, Map<Integer, S3Checksum> partChecksums,
