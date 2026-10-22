@@ -50,8 +50,8 @@ class KinesisTerminalReadServiceTest {
     }
 
     @SuppressWarnings("unchecked")
-    private List<KinesisService.ChildShard> children(Map<String, Object> page) {
-        return (List<KinesisService.ChildShard>) page.get("ChildShards");
+    private List<KinesisShard> children(Map<String, Object> page) {
+        return (List<KinesisShard>) page.get("ChildShards");
     }
 
     @Test
@@ -62,12 +62,16 @@ class KinesisTerminalReadServiceTest {
         split();
         Map<String, Object> page = service.getRecords(iterator("AT_SEQUENCE_NUMBER", last, null), 10, REGION);
         assertEquals(1, ((List<?>) page.get("Records")).size());
-        assertNull(page.get("NextShardIterator"));
+        assertNotNull(page.get("NextShardIterator"), "the page that returns the final records still continues");
+        Map<String, Object> end = service.getRecords((String) page.get("NextShardIterator"), 10, REGION);
+        assertTrue(((List<?>) end.get("Records")).isEmpty());
+        assertNull(end.get("NextShardIterator"));
+        assertEquals(2, children(end).size());
     }
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void finalNonemptyPageTerminatesAndOnlyTerminalPagesHaveChildren(boolean account) {
+    void finalRecordsPageContinuesAndOnlyTheFollowingEmptyPageHasChildren(boolean account) {
         service.createStream("s", 1, REGION);
         put("first");
         put("last");
@@ -78,13 +82,17 @@ class KinesisTerminalReadServiceTest {
         assertFalse(first.containsKey("ChildShards"));
         Map<String, Object> last = read(account, (String) first.get("NextShardIterator"), 1);
         assertEquals(1, ((List<?>) last.get("Records")).size());
-        assertNull(last.get("NextShardIterator"));
-        assertEquals(0L, last.get("MillisBehindLatest"));
+        assertNotNull(last.get("NextShardIterator"), "the page that returns the final records still continues");
+        assertFalse(last.containsKey("ChildShards"));
+        Map<String, Object> end = read(account, (String) last.get("NextShardIterator"), 1);
+        assertTrue(((List<?>) end.get("Records")).isEmpty());
+        assertNull(end.get("NextShardIterator"));
+        assertEquals(0L, end.get("MillisBehindLatest"));
         assertEquals(List.of("shardId-000000000001", "shardId-000000000002"),
-                children(last).stream().map(KinesisService.ChildShard::shardId).toList());
-        assertEquals(List.of(PARENT), children(last).getFirst().parentShards());
+                children(end).stream().map(KinesisShard::getShardId).toList());
+        assertEquals(PARENT, children(end).getFirst().getParentShardId());
         assertEquals(new KinesisShard.HashKeyRange("0", "170141183460469231731687303715884105727"),
-                children(last).getFirst().hashKeyRange());
+                children(end).getFirst().getHashKeyRange());
     }
 
     @ParameterizedTest
@@ -121,7 +129,7 @@ class KinesisTerminalReadServiceTest {
         assertTrue(((List<?>) page.get("Records")).isEmpty());
         assertNull(page.get("NextShardIterator"));
         assertEquals(List.of("shardId-000000000001", "shardId-000000000002"),
-                children(page).stream().map(KinesisService.ChildShard::shardId).toList());
+                children(page).stream().map(KinesisShard::getShardId).toList());
     }
 
     @ParameterizedTest
@@ -134,8 +142,13 @@ class KinesisTerminalReadServiceTest {
             String cursor = service.getShardIterator("s", parent, "TRIM_HORIZON", null, null, REGION);
             Map<String, Object> page = read(account, cursor, 10);
             assertNull(page.get("NextShardIterator"));
-            assertEquals(List.of(new KinesisService.ChildShard("shardId-000000000002", List.of(PARENT, adjacent),
-                    new KinesisShard.HashKeyRange("0", "340282366920938463463374607431768211455"))), children(page));
+            assertEquals(1, children(page).size());
+            KinesisShard child = children(page).getFirst();
+            assertEquals("shardId-000000000002", child.getShardId());
+            assertEquals(PARENT, child.getParentShardId());
+            assertEquals(adjacent, child.getAdjacentParentShardId());
+            assertEquals(new KinesisShard.HashKeyRange("0", "340282366920938463463374607431768211455"),
+                    child.getHashKeyRange());
         }
     }
 
@@ -172,8 +185,11 @@ class KinesisTerminalReadServiceTest {
                 assertNotNull(open.get("NextShardIterator"));
                 assertEquals(1, ((List<?>) open.get("Records")).size());
                 mutation.get(5, TimeUnit.SECONDS);
-                Map<String, Object> terminal = read(account, (String) open.get("NextShardIterator"), 10);
-                assertEquals(1, ((List<?>) terminal.get("Records")).size());
+                Map<String, Object> continued = read(account, (String) open.get("NextShardIterator"), 10);
+                assertEquals(1, ((List<?>) continued.get("Records")).size());
+                assertNotNull(continued.get("NextShardIterator"));
+                Map<String, Object> terminal = read(account, (String) continued.get("NextShardIterator"), 10);
+                assertTrue(((List<?>) terminal.get("Records")).isEmpty());
                 assertNull(terminal.get("NextShardIterator"));
                 assertEquals(2, children(terminal).size());
             } finally {

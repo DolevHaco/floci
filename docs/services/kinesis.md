@@ -80,17 +80,7 @@ aws kinesis describe-stream --stream-arn arn:aws:kinesis:us-east-1:000000000000:
 
 A `LATEST` iterator is positioned at the shard tip at the moment the iterator is created, matching AWS: records written after the iterator was obtained are returned, records written before are not. This supports the standard tailing pattern: obtain a `LATEST` iterator, trigger the action that produces the record, then poll `GetRecords` following `NextShardIterator`.
 
-A closed shard returns a JSON null `NextShardIterator` on its final page, including
-when that page contains records. Earlier pages keep their continuation iterator.
-Only the terminal page includes `ChildShards`: each direct child's ID, all of its
-parent IDs and its hash-key range. A caught-up open shard keeps a non-null iterator.
-Consumers should process the final records before stopping at the null iterator.
-
-The internal Pipes and Firehose readers retain a sequence cursor after the final
-record to avoid replaying a terminal batch. Firehose commits that cursor only after
-delivery succeeds; its unflushed buffer remains in memory. Pipes keeps its existing
-advance-before-delivery policy and first-shard polling limitation; child scheduling
-and full lineage orchestration are not implemented.
+A shard closed by `SplitShard`, `MergeShards` or `UpdateShardCount` ends: once an iterator is past its last record, `GetRecords` returns no records, no `NextShardIterator`, and the shard's `ChildShards` (`ShardId`, `ParentShards`, `HashKeyRange`), so a consumer knows to continue with the children. The response that returns the final records still carries a `NextShardIterator`; the call made with it reports the end.
 
 ## Record Retention
 

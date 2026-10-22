@@ -90,7 +90,8 @@ class PipesKinesisTerminalTest {
                     .invoke(eq(pipe), anyString(), eq("eu-west-1"));
             verify(sqs, times("dlq".equals(outcome) || "drop".equals(outcome) ? recordCount : 0))
                     .sendMessage(anyString(), anyString(), eq(0), eq("eu-west-1"));
-            assertEquals(recordCount == 0 ? 0 : 1, terminalRecordPages.get(), "the terminal record page must be consumed once");
+            assertEquals(0, terminalRecordPages.get(),
+                    "the page that returns the final records keeps an iterator; the following call ends the shard");
         } finally {
             poller.shutdown();
         }

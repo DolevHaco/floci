@@ -435,7 +435,10 @@ public class KinesisJsonHandler {
             eventPayload.put("ContinuationSequenceNumber", continuationSeqNo);
         }
         eventPayload.put("MillisBehindLatest", millisBehind);
-        writeChildShards(eventPayload, result);
+        List<KinesisShard> subscribedChildren = (List<KinesisShard>) result.get("ChildShards");
+        if (subscribedChildren != null) {
+            putChildShards(eventPayload.putArray("ChildShards"), subscribedChildren);
+        }
 
         try {
             // The Go SDK (and other SDKs) expect an initial-response message before
@@ -734,27 +737,31 @@ public class KinesisJsonHandler {
                 rNode.put("ApproximateArrivalTimestamp", epochSeconds(rec.getApproximateArrivalTimestamp()));
             }
         }
-        response.put("NextShardIterator", (String) result.get("NextShardIterator"));
-        writeChildShards(response, result);
+        String nextIterator = (String) result.get("NextShardIterator");
+        if (nextIterator != null) {
+            response.put("NextShardIterator", nextIterator);
+        }
         response.put("MillisBehindLatest", ((Number) result.get("MillisBehindLatest")).longValue());
+        List<KinesisShard> childShards = (List<KinesisShard>) result.get("ChildShards");
+        if (childShards != null) {
+            putChildShards(response.putArray("ChildShards"), childShards);
+        }
         return Response.ok(response).build();
     }
 
-    @SuppressWarnings("unchecked")
-    private void writeChildShards(ObjectNode response, Map<String, Object> result) {
-        List<KinesisService.ChildShard> children = (List<KinesisService.ChildShard>) result.get("ChildShards");
-        if (children == null) {
-            return;
-        }
-        ArrayNode childNodes = response.putArray("ChildShards");
-        for (KinesisService.ChildShard child : children) {
-            ObjectNode node = childNodes.addObject();
-            node.put("ShardId", child.shardId());
+    /** ChildShard entries: the shard id, its parent (and adjacent parent, for a merge) and its hash key range. */
+    private static void putChildShards(ArrayNode array, List<KinesisShard> childShards) {
+        for (KinesisShard child : childShards) {
+            ObjectNode node = array.addObject();
+            node.put("ShardId", child.getShardId());
             ArrayNode parents = node.putArray("ParentShards");
-            child.parentShards().forEach(parents::add);
+            parents.add(child.getParentShardId());
+            if (child.getAdjacentParentShardId() != null) {
+                parents.add(child.getAdjacentParentShardId());
+            }
             node.putObject("HashKeyRange")
-                    .put("StartingHashKey", child.hashKeyRange().startingHashKey())
-                    .put("EndingHashKey", child.hashKeyRange().endingHashKey());
+                    .put("StartingHashKey", child.getHashKeyRange().startingHashKey())
+                    .put("EndingHashKey", child.getHashKeyRange().endingHashKey());
         }
     }
 

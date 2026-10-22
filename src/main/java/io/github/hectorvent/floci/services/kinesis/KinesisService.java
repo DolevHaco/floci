@@ -894,8 +894,14 @@ public class KinesisService implements ResourceProvider {
             }
         }
 
-        ShardReadSnapshot read = snapshotShard(null, streamName, shardId, region);
-        KinesisShard.RecordsSnapshot snapshot = read.records();
+        KinesisStream stream = resolveStream(streamName, region);
+        KinesisShard shard = stream.getShards().stream()
+                .filter(s -> s.getShardId().equals(shardId))
+                .findFirst()
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Shard not found", 400));
+        pruneExpiredRecords(stream, shard);
+
+        KinesisShard.RecordsSnapshot snapshot = shard.snapshotRecords();
         List<KinesisRecord> allRecords = snapshot.records();
         int startIndex = 0;
 
@@ -941,45 +947,26 @@ public class KinesisService implements ResourceProvider {
             }
         }
 
-        return recordsPage(streamName, shardId, read, startIndex, limit);
+        return recordsPage(stream, shard, streamName, allRecords, startIndex, limit);
     }
 
-    public record ChildShard(String shardId, List<String> parentShards, KinesisShard.HashKeyRange hashKeyRange) {}
-
-    private record ShardReadSnapshot(KinesisShard.RecordsSnapshot records, boolean closed,
-                                     List<ChildShard> children) {}
-
-    private ShardReadSnapshot snapshotShard(String accountId, String streamName, String shardId, String region) {
-        // Share the append/reshard monitor so a terminal snapshot includes the final append and topology.
-        synchronized (lockFor(regionKey(region, streamName))) {
-            KinesisStream stream = resolveStreamForAccount(accountId, streamName, region);
-            KinesisShard shard = stream.getShards().stream()
-                    .filter(candidate -> candidate.getShardId().equals(shardId))
-                    .findFirst()
-                    .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Shard not found", 400));
-            pruneExpiredRecords(stream, shard);
-            List<ChildShard> children = new ArrayList<>();
-            if (shard.isClosed()) {
-                for (KinesisShard child : stream.getShards()) {
-                    if (shardId.equals(child.getParentShardId()) || shardId.equals(child.getAdjacentParentShardId())) {
-                        List<String> parents = new ArrayList<>();
-                        if (child.getParentShardId() != null) {
-                            parents.add(child.getParentShardId());
-                        }
-                        if (child.getAdjacentParentShardId() != null) {
-                            parents.add(child.getAdjacentParentShardId());
-                        }
-                        children.add(new ChildShard(child.getShardId(), List.copyOf(parents), child.getHashKeyRange()));
-                    }
-                }
-            }
-            return new ShardReadSnapshot(shard.snapshotRecords(), shard.isClosed(), List.copyOf(children));
+    /**
+     * One GetRecords page from {@code startIndex}. A closed shard read from past its last record has no
+     * more data, so the page carries no NextShardIterator and lists the shard's ChildShards instead. The
+     * page that returns the final records still continues: pollers that keep their previous iterator on a
+     * null one would otherwise read those records again.
+     */
+    private Map<String, Object> recordsPage(KinesisStream stream, KinesisShard shard, String streamName,
+                                            List<KinesisRecord> allRecords, int startIndex, Integer limit) {
+        Map<String, Object> response = new HashMap<>();
+        if (shard.isClosed() && startIndex >= allRecords.size()) {
+            response.put("Records", List.of());
+            response.put("NextShardIterator", null);
+            response.put("MillisBehindLatest", 0L);
+            response.put("ChildShards", childShards(stream, shard.getShardId()));
+            return response;
         }
-    }
 
-    private Map<String, Object> recordsPage(String streamName, String shardId, ShardReadSnapshot read,
-                                             int startIndex, Integer limit) {
-        List<KinesisRecord> allRecords = read.records().records();
         int max = limit != null ? Math.min(limit, 1000) : 1000;
         List<KinesisRecord> result = new ArrayList<>();
         int nextIndex = startIndex;
@@ -987,16 +974,19 @@ public class KinesisService implements ResourceProvider {
             result.add(allRecords.get(i));
             nextIndex = i + 1;
         }
-        boolean terminal = read.closed() && nextIndex >= allRecords.size();
-        Map<String, Object> response = new HashMap<>();
+
         response.put("Records", result);
-        response.put("NextShardIterator", terminal ? null
-                : buildContinuationIterator(streamName, shardId, allRecords, nextIndex));
+        response.put("NextShardIterator",
+                buildContinuationIterator(streamName, shard.getShardId(), allRecords, nextIndex));
         response.put("MillisBehindLatest", computeMillisBehindLatest(allRecords, nextIndex));
-        if (terminal) {
-            response.put("ChildShards", read.children());
-        }
         return response;
+    }
+
+    /** The shards a split or merge of {@code shardId} created. */
+    private static List<KinesisShard> childShards(KinesisStream stream, String shardId) {
+        return stream.getShards().stream()
+                .filter(s -> shardId.equals(s.getParentShardId()) || shardId.equals(s.getAdjacentParentShardId()))
+                .toList();
     }
 
     public record PeekedRecord(String shardId, KinesisRecord record) {}
@@ -1185,8 +1175,14 @@ public class KinesisService implements ResourceProvider {
             }
         }
 
-        ShardReadSnapshot read = snapshotShard(accountId, streamName, shardId, region);
-        KinesisShard.RecordsSnapshot snapshot = read.records();
+        KinesisStream stream = resolveStreamForAccount(accountId, streamName, region);
+        KinesisShard shard = stream.getShards().stream()
+                .filter(s -> s.getShardId().equals(shardId))
+                .findFirst()
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Shard not found", 400));
+        pruneExpiredRecords(stream, shard);
+
+        KinesisShard.RecordsSnapshot snapshot = shard.snapshotRecords();
         List<KinesisRecord> allRecords = snapshot.records();
         int startIndex = 0;
         // LATEST resolves the same way as AFTER_SEQUENCE_NUMBER (see the longer explanation in
@@ -1216,7 +1212,7 @@ public class KinesisService implements ResourceProvider {
             }
         }
 
-        return recordsPage(streamName, shardId, read, startIndex, limit);
+        return recordsPage(stream, shard, streamName, allRecords, startIndex, limit);
     }
 
     private KinesisShard selectShard(KinesisStream stream, String partitionKey, String explicitHashKey) {

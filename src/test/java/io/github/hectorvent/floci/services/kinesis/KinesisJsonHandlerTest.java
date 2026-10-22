@@ -69,15 +69,19 @@ class KinesisJsonHandlerTest {
         String cursor = service.getShardIterator("test-stream", FIRST_SHARD_ID, "TRIM_HORIZON", null, null, REGION);
         ObjectNode request = MAPPER.createObjectNode().put("ShardIterator", cursor);
         JsonNode page = MAPPER.readTree(responseEntity(handler.handle("GetRecords", request, REGION)).toString());
-        assertTrue(page.has("NextShardIterator"));
-        assertTrue(page.get("NextShardIterator").isNull());
+        assertFalse(page.get("NextShardIterator").isNull());
         assertEquals(1, page.path("Records").size());
+        assertFalse(page.has("ChildShards"));
+        ObjectNode next = MAPPER.createObjectNode().put("ShardIterator", page.get("NextShardIterator").asText());
+        JsonNode end = MAPPER.readTree(responseEntity(handler.handle("GetRecords", next, REGION)).toString());
+        assertFalse(end.has("NextShardIterator"));
+        assertEquals(0, end.path("Records").size());
         assertEquals(MAPPER.readTree("""
                 [{"ShardId":"shardId-000000000001","ParentShards":["shardId-000000000000"],
                   "HashKeyRange":{"StartingHashKey":"0","EndingHashKey":"99"}},
                  {"ShardId":"shardId-000000000002","ParentShards":["shardId-000000000000"],
                   "HashKeyRange":{"StartingHashKey":"100","EndingHashKey":"340282366920938463463374607431768211455"}}]
-                """), page.path("ChildShards"));
+                """), end.path("ChildShards"));
     }
 
     @ParameterizedTest
@@ -102,10 +106,15 @@ class KinesisJsonHandlerTest {
         buffer.get(payload);
         JsonNode event = MAPPER.readTree(payload);
         assertEquals(nonempty ? 1 : 0, event.path("Records").size());
-        assertFalse(event.has("ContinuationSequenceNumber"));
-        assertEquals(2, event.path("ChildShards").size());
-        assertEquals(FIRST_SHARD_ID, event.path("ChildShards").get(0).path("ParentShards").get(0).asText());
-        assertEquals("99", event.path("ChildShards").get(0).path("HashKeyRange").path("EndingHashKey").asText());
+        if (nonempty) {
+            assertTrue(event.has("ContinuationSequenceNumber"));
+            assertEquals(0, event.path("ChildShards").size());
+        } else {
+            assertFalse(event.has("ContinuationSequenceNumber"));
+            assertEquals(2, event.path("ChildShards").size());
+            assertEquals(FIRST_SHARD_ID, event.path("ChildShards").get(0).path("ParentShards").get(0).asText());
+            assertEquals("99", event.path("ChildShards").get(0).path("HashKeyRange").path("EndingHashKey").asText());
+        }
     }
 
     // Retention is measured against the service clock, so a test that plants a fixed arrival
