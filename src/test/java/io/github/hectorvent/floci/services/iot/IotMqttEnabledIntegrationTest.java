@@ -356,6 +356,35 @@ class IotMqttEnabledIntegrationTest {
     }
 
     @Test
+    void onlyASubscriptionNamingTheTopicExactlyReceivesItsRetainedMessage() throws Exception {
+        String device = "phase/retained/" + System.nanoTime();
+        String topic = device + "/state";
+        byte[] payload = "kept".getBytes(StandardCharsets.UTF_8);
+        given()
+            .contentType("application/octet-stream")
+            .queryParam("retain", true)
+            .body(payload)
+        .when()
+            .post("/topics/" + topic)
+        .then()
+            .statusCode(200);
+        cleanup.register(() -> given().contentType("application/octet-stream").queryParam("retain", true).body(new byte[0])
+                .when().post("/topics/" + topic).then().statusCode(200));
+
+        try (MqttTestClient wildcard = connectMqtt("retained-wildcard-sub")) {
+            wildcard.subscribe(device + "/+", 1);
+            wildcard.subscribe(device + "/#", 1);
+            wildcard.assertNoPublish();
+        }
+        try (MqttTestClient exact = connectMqtt("retained-exact-sub")) {
+            exact.subscribe(topic, 1);
+            MqttPublish retained = exact.takePublish();
+            assertEquals(topic, retained.topic());
+            assertArrayEquals(payload, retained.payload());
+        }
+    }
+
+    @Test
     void publishOfTheAwsMaximumPayloadIsDelivered() throws Exception {
         String topic = "phase6/limit/" + System.nanoTime();
         byte[] payload = randomPayload(AWS_MAX_PAYLOAD);

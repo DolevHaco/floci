@@ -14,7 +14,7 @@ Supported MVP 1 behavior:
 - Policy basics: `CreatePolicy`, `GetPolicy`, `ListPolicies`, `DeletePolicy`, policy version lifecycle, `AttachPolicy`, `DetachPolicy`, `ListAttachedPolicies`, and `ListTargetsForPolicy`.
 - Thing principal basics: `AttachThingPrincipal`, `DetachThingPrincipal`, `ListThingPrincipals`, `ListPrincipalThings`, and the paginated `ListThingPrincipalsV2` and `ListPrincipalThingsV2`. Exclusive attachment is not modelled, so the V2 lists report every attachment as `NON_EXCLUSIVE_THING`, and a `thingPrincipalType` filter of `EXCLUSIVE_THING` returns none.
 - Tags for things, certificates, policies, and topic rules.
-- IoT Data retained messages: retained `Publish`, `GetRetainedMessage`, and paginated `ListRetainedMessages`. Both read actions report `lastModifiedTime` as integer epoch milliseconds, as required by the IoT Data API.
+- IoT Data retained messages: retained `Publish`, `GetRetainedMessage`, and paginated `ListRetainedMessages`. Both read actions report `lastModifiedTime` as integer epoch milliseconds, as required by the IoT Data API. As on AWS IoT, an MQTT subscription receives a retained message only when its topic filter names that topic exactly; a filter with `+` or `#` receives none.
 - Shadow null-delete and version-conflict behavior for HTTP and shared service paths.
 - Topic rule duplicate/delete/replace semantics, plus `republish`, `sqs`, `sns`, `s3`, `dynamoDBv2`, `kinesis`, `lambda`, `firehose`, and `cloudwatchLogs` action dispatch.
 
@@ -43,7 +43,6 @@ Supported MVP 2 behavior:
 Current MVP 2 limitations:
 
 - HTTP IoT Data `Publish` reaches MQTT subscribers as an MQTT publish does, whatever account and region they connected in: the broker has neither, where AWS runs one per account and region. It refuses a `qos` other than 0 or 1 with AWS's `InvalidRequestException`. Its MQTT 5 metadata (`contentType`, `correlationData`, `messageExpiry`, `payloadFormatIndicator`, `responseTopic`, `userProperties`) is accepted but not forwarded.
-- A retained message is also sent on a subscription to a wildcard filter that matches its topic. AWS sends it only to a subscription naming its exact topic.
 - A QoS 1 copy sent to a subscriber is never retried, and no limit applies to how many stay unacknowledged. AWS holds further copies once a client has 100 unacknowledged and retries them for up to an hour (16 minutes for MQTT 5).
 - `SendDirectMessage` publishes to the requested MQTT topic through the embedded broker. Unlike AWS IoT Core, it does not yet bypass subscription matching to deliver to a client that is not subscribed to that topic.
 - `GetConnection` and `ListSubscriptions` report live in-memory broker state only; offline persistent session subscription reporting is not modeled yet.

@@ -838,23 +838,25 @@ public class IotMqttBrokerService implements Resettable {
                 .orElse(-1);
     }
 
+    /**
+     * As on AWS IoT, only a topic filter without wildcards receives a retained message: the one
+     * stored for exactly that topic.
+     */
     private void deliverRetained(ClientSession session, List<Subscription> subscriptions) {
-        if (subscriptions.isEmpty()) {
-            return;
-        }
         Set<String> deliveredTopics = new HashSet<>();
-        for (IotRetainedMessage retained : iotService.get().listRetainedMessages(null, null).items()) {
-            if (!deliveredTopics.add(retained.getTopic())) {
+        for (Subscription subscription : subscriptions) {
+            String topic = subscription.topicFilter();
+            if (topic.contains("+") || topic.contains("#") || !deliveredTopics.add(topic)) {
                 continue;
             }
-            int granted = grantedQos(subscriptions, retained.getTopic());
-            if (granted < 0) {
+            Optional<IotRetainedMessage> retained = iotService.get().findRetainedMessage(topic);
+            if (retained.isEmpty()) {
                 continue;
             }
-            byte[] payload = Base64.getDecoder().decode(retained.getPayload());
+            byte[] payload = Base64.getDecoder().decode(retained.get().getPayload());
             // Publish kept a qos outside 0 and 1 as sent before it refused one, so a stored message may carry one.
-            MqttQoS delivered = MqttQoS.valueOf(Math.clamp(retained.getQos(), 0, granted));
-            session.endpoint().publish(retained.getTopic(), Buffer.buffer(payload), delivered, false, true, session.packetId(delivered));
+            MqttQoS delivered = MqttQoS.valueOf(Math.clamp(retained.get().getQos(), 0, subscription.qos()));
+            session.endpoint().publish(topic, Buffer.buffer(payload), delivered, false, true, session.packetId(delivered));
         }
     }
 

@@ -1252,8 +1252,12 @@ public class IotService {
     }
 
     public IotRetainedMessage getRetainedMessage(String topic) {
-        return retainedMessageStore.get(retainedMessageKey(topic))
+        return findRetainedMessage(topic)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Retained message not found: " + topic, 404));
+    }
+
+    Optional<IotRetainedMessage> findRetainedMessage(String topic) {
+        return retainedMessageStore.get(retainedMessageKey(topic));
     }
 
     public Page<IotRetainedMessage> listRetainedMessages(Integer maxResults, String nextToken) {
