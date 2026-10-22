@@ -924,7 +924,9 @@ Off by default. With `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_ENABLED=true`, a 
 definition sets a resolvable `taskRoleArn` gets credentials for that role the way real ECS vends
 them: Floci
 writes `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` into every container in the task, pointing at one
-`/v2/credentials/{id}` path per task, and the AWS SDKs pick it up with no code change.
+`/v2/credentials/{id}` path per task, and the AWS SDKs pick it up with no code change. A
+`RunTask` `overrides.taskRoleArn` takes the place of the definition's role, and gives a task
+whose definition names none a role of its own.
 
 The published path stays the same when credentials renew, including when a task first reads it
 after the previous credentials expire. Reads near expiry return a fresh session. Credentials

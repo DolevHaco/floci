@@ -53,6 +53,7 @@ import io.github.hectorvent.floci.services.ecs.model.PortMapping;
 import io.github.hectorvent.floci.services.ecs.model.Secret;
 import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
 import io.github.hectorvent.floci.services.ecs.model.TaskNetworkInterface;
+import io.github.hectorvent.floci.services.ecs.model.TaskOverride;
 import io.github.hectorvent.floci.services.ecs.model.Volume;
 import io.github.hectorvent.floci.services.ecs.model.VolumeFrom;
 import io.github.hectorvent.floci.services.efs.EfsService;
@@ -1888,7 +1889,7 @@ public class EcsContainerManager {
      */
     private TaskRoleCredentialEndpoint prepareTaskRoleCredentials(EcsTask task, TaskDefinition taskDef,
                                                                   PreparedNetwork protectedNetwork) {
-        String taskRoleArn = taskDef.getTaskRoleArn();
+        String taskRoleArn = taskRoleArn(task, taskDef);
         if (taskRoleArn == null || taskRoleArn.isBlank()) {
             return TaskRoleCredentialEndpoint.none();
         }
@@ -1928,6 +1929,15 @@ public class EcsContainerManager {
             throw e;
         }
         return new TaskRoleCredentialEndpoint(relativeUri.get(), network.get());
+    }
+
+    /** The role a task runs as: the one its RunTask overrides name, otherwise its task definition's. */
+    private static String taskRoleArn(EcsTask task, TaskDefinition taskDef) {
+        TaskOverride overrides = task.getOverrides();
+        if (overrides != null && overrides.getTaskRoleArn() != null && !overrides.getTaskRoleArn().isBlank()) {
+            return overrides.getTaskRoleArn();
+        }
+        return taskDef.getTaskRoleArn();
     }
 
     /**
