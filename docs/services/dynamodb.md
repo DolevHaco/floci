@@ -89,7 +89,9 @@ For legacy `Expected` conditions it also accepts `ComparisonOperator` with a sin
 `Value`, including EQ and NE, just as the live AWS service does. Supplying both
 `Value` and `AttributeValueList`, omitting a required operand, or supplying the wrong
 number of operands returns `ValidationException` without changing the item.
-`NULL` and `NOT_NULL` take no operands.
+`NULL` and `NOT_NULL` take no operands. An `Expected` condition is checked atomically with the
+write, like a `ConditionExpression`, so version checks such as DynamoDBMapper optimistic locking
+hold when several writers race on the same item.
 
 These behaviors were verified against AWS in `us-east-1` on October 12, 2026:
 40 pairs of equivalent conditional writes, matching and nonmatching queries,

@@ -19,6 +19,7 @@ import io.github.hectorvent.floci.services.kinesis.KinesisService;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisRecord;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisStream;
 import io.github.hectorvent.floci.testing.StartGate;
+import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
@@ -31,8 +32,13 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -555,6 +561,206 @@ class DynamoDbConcurrencyIntegrationTest {
         }
         assertEquals(expectedKeys, sortKeys, "the forwarded sk set must match exactly, with no gaps");
         assertEquals(0L, forwarder.getForwardFailureCount(), "no CDC event may be dropped");
+    }
+
+    // While armed, every GetItem holds its result until its peer has read too, so racing requests
+    // that read the item before writing it all read the same state before any of them writes.
+    private final AtomicReference<CyclicBarrier> readGate = new AtomicReference<>();
+
+    private NativeDynamoDbJsonHandler handlerWithGatedReads() {
+        service = new DynamoDbService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new RegionResolver("us-east-1", "000000000000")) {
+            @Override
+            public JsonNode getItem(String tableName, JsonNode key, String region) {
+                JsonNode item = super.getItem(tableName, key, region);
+                CyclicBarrier gate = readGate.get();
+                if (gate != null) {
+                    try {
+                        gate.await(5, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } catch (BrokenBarrierException | TimeoutException expected) {
+                        // A read with no peer to meet just goes ahead on its own.
+                    }
+                }
+                return item;
+            }
+        };
+        return new NativeDynamoDbJsonHandler(service, null, null, mapper);
+    }
+
+    private JsonNode json(String body) {
+        try {
+            return mapper.readTree(body);
+        } catch (Exception e) {
+            throw new IllegalArgumentException(body, e);
+        }
+    }
+
+    private JsonNode responseBody(Response response) {
+        return mapper.convertValue(response.getEntity(), JsonNode.class);
+    }
+
+    private static Response call(NativeDynamoDbJsonHandler handler, String action, JsonNode request) {
+        try {
+            return handler.handle(action, request, "us-east-1");
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException(action + " failed", e);
+        }
+    }
+
+    private List<Throwable> runRacingRequests(int requests, Runnable work) throws InterruptedException {
+        readGate.set(new CyclicBarrier(requests));
+        try {
+            return runConcurrently(requests, work);
+        } finally {
+            readGate.set(null);
+        }
+    }
+
+    @RepeatedTest(REPEATS)
+    void legacyExpected_putItem_existsFalse_isCheckedAgainstTheItemUnderTheLock() throws InterruptedException {
+        NativeDynamoDbJsonHandler handler = handlerWithGatedReads();
+        createCounterTable("us-east-1");
+        AtomicInteger writerId = new AtomicInteger();
+        AtomicInteger successes = new AtomicInteger();
+        AtomicInteger conditionalFailures = new AtomicInteger();
+
+        List<Throwable> errors = runRacingRequests(2, () -> {
+            JsonNode request = json("""
+                    {"TableName":"Counters","Item":{"pk":{"S":"unique"},"writer":{"S":"w-%d"}},
+                     "Expected":{"pk":{"Exists":false}}}
+                    """.formatted(writerId.getAndIncrement()));
+            try {
+                call(handler, "PutItem", request);
+                successes.incrementAndGet();
+            } catch (ConditionalCheckFailedException e) {
+                conditionalFailures.incrementAndGet();
+            }
+        });
+
+        assertTrue(errors.isEmpty(), () -> "unexpected errors: " + errors);
+        assertEquals(1, successes.get(), "only one PutItem may create the item when Expected says it is absent");
+        assertEquals(1, conditionalFailures.get());
+    }
+
+    @RepeatedTest(REPEATS)
+    void legacyExpected_deleteItem_isCheckedAgainstTheItemUnderTheLock() throws InterruptedException {
+        NativeDynamoDbJsonHandler handler = handlerWithGatedReads();
+        createCounterTable("us-east-1");
+        ObjectNode seed = itemWithPk("to-delete");
+        seed.set("marker", stringAttr("present"));
+        service.putItem("Counters", seed, "us-east-1");
+        AtomicInteger successes = new AtomicInteger();
+        AtomicInteger conditionalFailures = new AtomicInteger();
+
+        List<Throwable> errors = runRacingRequests(2, () -> {
+            JsonNode request = json("""
+                    {"TableName":"Counters","Key":{"pk":{"S":"to-delete"}},
+                     "Expected":{"marker":{"Value":{"S":"present"}}}}
+                    """);
+            try {
+                call(handler, "DeleteItem", request);
+                successes.incrementAndGet();
+            } catch (ConditionalCheckFailedException e) {
+                conditionalFailures.incrementAndGet();
+            }
+        });
+
+        assertTrue(errors.isEmpty(), () -> "unexpected errors: " + errors);
+        assertEquals(1, successes.get(), "the second DeleteItem must see the item already gone");
+        assertEquals(1, conditionalFailures.get());
+    }
+
+    @RepeatedTest(REPEATS)
+    void legacyExpected_updateItem_versionCheck_isCheckedAgainstTheItemUnderTheLock() throws InterruptedException {
+        NativeDynamoDbJsonHandler handler = handlerWithGatedReads();
+        createCounterTable("us-east-1");
+        ObjectNode seed = itemWithPk("versioned");
+        seed.set("version", numberAttr("1"));
+        service.putItem("Counters", seed, "us-east-1");
+        AtomicInteger writerId = new AtomicInteger();
+        AtomicInteger successes = new AtomicInteger();
+        AtomicInteger conditionalFailures = new AtomicInteger();
+
+        List<Throwable> errors = runRacingRequests(2, () -> {
+            JsonNode request = json("""
+                    {"TableName":"Counters","Key":{"pk":{"S":"versioned"}},
+                     "Expected":{"version":{"Value":{"N":"1"}}},
+                     "AttributeUpdates":{"version":{"Action":"PUT","Value":{"N":"2"}},
+                                         "writer":{"Action":"PUT","Value":{"S":"w-%d"}}}}
+                    """.formatted(writerId.getAndIncrement()));
+            try {
+                call(handler, "UpdateItem", request);
+                successes.incrementAndGet();
+            } catch (ConditionalCheckFailedException e) {
+                conditionalFailures.incrementAndGet();
+            }
+        });
+
+        assertTrue(errors.isEmpty(), () -> "unexpected errors: " + errors);
+        assertEquals(1, successes.get(), "only one writer may move version 1 to 2");
+        assertEquals(1, conditionalFailures.get());
+    }
+
+    @RepeatedTest(REPEATS)
+    void putItem_returnValuesAllOld_returnsTheItemTheWriteReplaced() throws InterruptedException {
+        NativeDynamoDbJsonHandler handler = handlerWithGatedReads();
+        createCounterTable("us-east-1");
+        ObjectNode seed = itemWithPk("swap");
+        seed.set("writer", stringAttr("seed"));
+        service.putItem("Counters", seed, "us-east-1");
+        AtomicInteger writerId = new AtomicInteger();
+        Map<String, String> replacedBy = new ConcurrentHashMap<>();
+
+        List<Throwable> errors = runRacingRequests(2, () -> {
+            String writer = "w-" + writerId.getAndIncrement();
+            JsonNode request = json("""
+                    {"TableName":"Counters","Item":{"pk":{"S":"swap"},"writer":{"S":"%s"}},
+                     "ReturnValues":"ALL_OLD"}
+                    """.formatted(writer));
+            JsonNode body = responseBody(call(handler, "PutItem", request));
+            replacedBy.put(writer, body.path("Attributes").path("writer").path("S").asText());
+        });
+
+        assertTrue(errors.isEmpty(), () -> "unexpected errors: " + errors);
+        List<String> firstWriters = replacedBy.entrySet().stream()
+                .filter(entry -> "seed".equals(entry.getValue()))
+                .map(Map.Entry::getKey)
+                .toList();
+        assertEquals(1, firstWriters.size(), () -> "exactly one PutItem replaced the seed: " + replacedBy);
+        String secondWriter = "w-0".equals(firstWriters.get(0)) ? "w-1" : "w-0";
+        assertEquals(firstWriters.get(0), replacedBy.get(secondWriter),
+                () -> "the second PutItem must return the item the first one wrote: " + replacedBy);
+    }
+
+    @RepeatedTest(REPEATS)
+    void concurrent_putItem_with_legacy_expected_exists_false_allows_exactly_one() throws InterruptedException {
+        createCounterTable("us-east-1");
+        NativeDynamoDbJsonHandler handler = new NativeDynamoDbJsonHandler(service, null, null, mapper);
+        AtomicInteger writerId = new AtomicInteger();
+        AtomicInteger successes = new AtomicInteger();
+        AtomicInteger conditionalFailures = new AtomicInteger();
+
+        List<Throwable> errors = runConcurrently(OPS_PER_SCENARIO, () -> {
+            JsonNode request = json("""
+                    {"TableName":"Counters","Item":{"pk":{"S":"legacy-unique"},"writer":{"S":"w-%d"}},
+                     "Expected":{"pk":{"Exists":false}}}
+                    """.formatted(writerId.getAndIncrement()));
+            try {
+                call(handler, "PutItem", request);
+                successes.incrementAndGet();
+            } catch (ConditionalCheckFailedException e) {
+                conditionalFailures.incrementAndGet();
+            }
+        });
+
+        assertTrue(errors.isEmpty(), () -> "unexpected errors: " + errors);
+        assertEquals(1, successes.get(),
+                "exactly one PutItem with Expected Exists:false should succeed under contention");
+        assertEquals(OPS_PER_SCENARIO - 1, conditionalFailures.get());
     }
 
     @Test
