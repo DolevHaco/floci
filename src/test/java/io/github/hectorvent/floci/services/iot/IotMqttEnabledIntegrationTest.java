@@ -369,6 +369,10 @@ class IotMqttEnabledIntegrationTest {
                 publisher.publish(topic, payload, 1);
                 publisher.publish(topic, payload, 0);
             }
+            // One connection's publishes reach a subscriber in order; an IoT Data publish is fanned out from another thread.
+            assertEquals(List.of(1, 0), List.of(atLeastOnce.takePublish().qos(), atLeastOnce.takePublish().qos()));
+            assertEquals(List.of(0, 0), List.of(atMostOnce.takePublish().qos(), atMostOnce.takePublish().qos()));
+
             given()
                 .contentType("application/octet-stream")
                 .queryParam("qos", 1)
@@ -378,10 +382,8 @@ class IotMqttEnabledIntegrationTest {
             .then()
                 .statusCode(200);
 
-            assertEquals(List.of(1, 0, 1), List.of(atLeastOnce.takePublish().qos(), atLeastOnce.takePublish().qos(),
-                    atLeastOnce.takePublish().qos()));
-            assertEquals(List.of(0, 0, 0), List.of(atMostOnce.takePublish().qos(), atMostOnce.takePublish().qos(),
-                    atMostOnce.takePublish().qos()));
+            assertEquals(1, atLeastOnce.takePublish().qos());
+            assertEquals(0, atMostOnce.takePublish().qos());
         }
     }
 
