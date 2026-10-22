@@ -417,8 +417,8 @@ public class KinesisJsonHandler {
         List<KinesisRecord> records = (List<KinesisRecord>) result.get("Records");
         long millisBehind = ((Number) result.get("MillisBehindLatest")).longValue();
 
-        String continuationSeqNo = result.get("NextShardIterator") == null || records.isEmpty() ? null
-                : records.get(records.size() - 1).getSequenceNumber();
+        String continuationSeqNo = (String) result.get("ContinuationSequenceNumber");
+        List<KinesisShard> childShards = (List<KinesisShard>) result.get("ChildShards");
 
         ObjectNode eventPayload = objectMapper.createObjectNode();
         ArrayNode recordsNode = eventPayload.putArray("Records");
@@ -435,9 +435,9 @@ public class KinesisJsonHandler {
             eventPayload.put("ContinuationSequenceNumber", continuationSeqNo);
         }
         eventPayload.put("MillisBehindLatest", millisBehind);
-        List<KinesisShard> subscribedChildren = (List<KinesisShard>) result.get("ChildShards");
-        if (subscribedChildren != null) {
-            putChildShards(eventPayload.putArray("ChildShards"), subscribedChildren);
+        ArrayNode childShardsNode = eventPayload.putArray("ChildShards");
+        if (childShards != null) {
+            putChildShards(childShardsNode, childShards);
         }
 
         try {

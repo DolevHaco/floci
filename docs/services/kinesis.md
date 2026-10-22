@@ -117,14 +117,7 @@ action, so that limit is intentionally unenforced here.
 
 ## Enhanced Fan-Out (EFO)
 
-`SubscribeToShard` uses a snapshot-and-close model: the server returns one batch
-of records as a binary EventStream response and closes the connection. For a
-nonterminal batch, use `ContinuationSequenceNumber` from the last delivered record
-when resubscribing. At a closed shard's end, the event includes the same direct
-`ChildShards` metadata and omits `ContinuationSequenceNumber`, even when it includes
-final records. This remains a snapshot response rather than a long-lived
-subscription. All five `StartingPosition` types are supported: `TRIM_HORIZON`,
-`LATEST`, `AT_SEQUENCE_NUMBER`, `AFTER_SEQUENCE_NUMBER`, `AT_TIMESTAMP`.
+`SubscribeToShard` uses a snapshot-and-close model: the server returns one batch of records as a binary EventStream response and closes the connection. The SDK resubscribes automatically using the event's `ContinuationSequenceNumber`. It is present even when the event delivers no records, as the position read up to, so resuming `AFTER_SEQUENCE_NUMBER` neither skips nor repeats records. At the end of a closed shard it is omitted and `ChildShards` lists the shards to continue with, as AWS does. All five `StartingPosition` types are supported: `TRIM_HORIZON`, `LATEST`, `AT_SEQUENCE_NUMBER`, `AFTER_SEQUENCE_NUMBER`, `AT_TIMESTAMP`.
 
 ```bash
 export AWS_ENDPOINT_URL=http://localhost:4566
