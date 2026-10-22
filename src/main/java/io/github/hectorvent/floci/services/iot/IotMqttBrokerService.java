@@ -855,6 +855,19 @@ public class IotMqttBrokerService implements Resettable {
     }
 
     /**
+     * Writes one PUBLISH to the session's client. A QoS 1 delivery takes its packet identifier
+     * from the session, as deliveries to one client come from several threads at once and the
+     * Vert.x endpoint numbers them without synchronization.
+     */
+    private static void deliver(ClientSession session, String topic, Buffer payload, MqttQoS qos, boolean retain) {
+        if (qos == MqttQoS.AT_LEAST_ONCE) {
+            session.endpoint().publish(topic, payload, qos, false, retain, session.nextPacketId());
+        } else {
+            session.endpoint().publish(topic, payload, qos, false, retain);
+        }
+    }
+
+    /**
      * As on AWS IoT, only a topic filter without wildcards receives a retained message: the one
      * stored for exactly that topic in the session's account.
      */
@@ -1040,6 +1053,11 @@ public class IotMqttBrokerService implements Resettable {
 
         HistoryKey historyKey() {
             return new HistoryKey(accountId, region, clientId);
+        }
+
+        /** The packet identifier of the next QoS 1 PUBLISH to this client: 1 to 65535, then 1 again. */
+        int nextPacketId() {
+            return packetIds.updateAndGet(id -> id % 65_535 + 1);
         }
 
         Connectivity connected() {

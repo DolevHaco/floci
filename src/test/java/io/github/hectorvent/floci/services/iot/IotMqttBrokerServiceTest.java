@@ -85,6 +85,7 @@ import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -519,6 +520,56 @@ class IotMqttBrokerServiceTest {
         } finally {
             disconnect(subscriber);
         }
+    }
+
+    /**
+     * Fan-out reaches one subscriber from several threads at once (publishing connections' event
+     * loops, IoT Data requests, lifecycle events). Each QoS 1 delivery is held until all of them
+     * are in flight together, and each carries its own packet identifier.
+     */
+    @Test
+    void concurrentQos1DeliveriesToOneClientCarryDistinctPacketIdentifiers() throws Exception {
+        when(iotService.get()).thenReturn(mock(IotService.class));
+        int deliveries = 8;
+        CountDownLatch allInFlight = new CountDownLatch(deliveries);
+        List<Integer> packetIds = Collections.synchronizedList(new ArrayList<>());
+        MqttEndpoint subscriber = mock(MqttEndpoint.class);
+        when(subscriber.clientIdentifier()).thenReturn("qos1-subscriber");
+        when(subscriber.isConnected()).thenReturn(true);
+        when(subscriber.publish(anyString(), any(), eq(MqttQoS.AT_LEAST_ONCE), anyBoolean(), anyBoolean(), anyInt()))
+                .thenAnswer(invocation -> {
+                    packetIds.add(invocation.getArgument(5));
+                    allInFlight.countDown();
+                    allInFlight.await(10, TimeUnit.SECONDS);
+                    return null;
+                });
+        broker.handleEndpoint(subscriber, false);
+        ArgumentCaptor<Handler<MqttSubscribeMessage>> subscribe = handlerCaptor();
+        verify(subscriber).subscribeHandler(subscribe.capture());
+        MqttTopicSubscription requested = mock(MqttTopicSubscription.class);
+        when(requested.topicName()).thenReturn("devices/+/metrics");
+        when(requested.qualityOfService()).thenReturn(MqttQoS.AT_LEAST_ONCE);
+        MqttSubscribeMessage subscription = mock(MqttSubscribeMessage.class);
+        when(subscription.topicSubscriptions()).thenReturn(List.of(requested));
+        subscribe.getValue().handle(subscription);
+
+        ExecutorService publishers = Executors.newFixedThreadPool(deliveries);
+        try {
+            List<Future<?>> published = new ArrayList<>();
+            for (int i = 0; i < deliveries; i++) {
+                String topic = "devices/d" + i + "/metrics";
+                published.add(publishers.submit(() -> broker.publish(topic, "{}".getBytes(StandardCharsets.UTF_8), 1)));
+            }
+            for (Future<?> outcome : published) {
+                outcome.get(30, TimeUnit.SECONDS);
+            }
+        } finally {
+            publishers.shutdownNow();
+        }
+
+        assertEquals(deliveries, packetIds.size(), "QoS 1 deliveries with a packet identifier the broker chose: " + packetIds);
+        assertEquals(deliveries, new HashSet<>(packetIds).size(), "distinct packet identifiers: " + packetIds);
+        assertTrue(packetIds.stream().allMatch(id -> id >= 1 && id <= 65_535), packetIds.toString());
     }
 
     /**
