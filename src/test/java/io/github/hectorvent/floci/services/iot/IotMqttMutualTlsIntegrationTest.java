@@ -1,5 +1,8 @@
 package io.github.hectorvent.floci.services.iot;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.testing.IotMqttTlsProfile;
 import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.quarkus.test.junit.QuarkusTest;
@@ -51,6 +54,7 @@ class IotMqttMutualTlsIntegrationTest {
     /** The name the device dials, which Paho also sends as the TLS server name. */
     static final String DOMAIN = "localhost";
 
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final String OTHER_ACCOUNT = "111100000013";
     private static final String CONNECT_ANY_CLIENT = policy("Allow", "arn:aws:iot:*:*:client/*", null);
     private static final String CONNECT_AS_ATTACHED_THING =
@@ -327,6 +331,29 @@ class IotMqttMutualTlsIntegrationTest {
         }
     }
 
+    @Test
+    void aDevicePublishRunsAKinesisActionAgainstTheStreamOfTheRulesAccount() throws Exception {
+        String authorization = signedBy(OTHER_ACCOUNT, "iot");
+        String kinesisAuthorization = signedBy(OTHER_ACCOUNT, "kinesis");
+        IotDeviceIdentity device = IotDeviceIdentity.provision(true, authorization, cleanup);
+        device.attachNewPolicy(CONNECT_ANY_CLIENT, cleanup);
+        String topic = "devices/kinesis-" + System.nanoTime() + "/telemetry";
+        String stream = "iot-account-stream-" + System.nanoTime();
+        kinesis(kinesisAuthorization, "CreateStream", "{\"StreamName\": \"" + stream + "\", \"ShardCount\": 1}");
+        cleanup.register(() -> kinesis(kinesisAuthorization, "DeleteStream", "{\"StreamName\": \"" + stream + "\"}"));
+        createRule(authorization, "deviceAccountKinesisRule" + System.nanoTime(), topic,
+                "{\"kinesis\": {\"roleArn\": \"arn:aws:iam::000000000000:role/iot-rule-role\", \"streamName\": \"" + stream
+                        + "\", \"partitionKey\": \"device\"}}");
+
+        MqttClient publisher = connectTls(device, "kinesis-pub-" + System.nanoTime());
+        publisher.publish(topic, "telemetry".getBytes(StandardCharsets.UTF_8), 1, false);
+        publisher.disconnect();
+        publisher.close();
+
+        assertEquals(List.of(Base64.getEncoder().encodeToString("telemetry".getBytes(StandardCharsets.UTF_8))),
+                awaitKinesisRecords(kinesisAuthorization, stream), "the record reached the stream of the rule's account");
+    }
+
     private static String signedBy(String account, String service) {
         return "AWS4-HMAC-SHA256 Credential=" + account + "/20260215/us-east-1/" + service + "/aws4_request, "
                 + "SignedHeaders=host, Signature=abc";
@@ -345,19 +372,59 @@ class IotMqttMutualTlsIntegrationTest {
     }
 
     private void createSqsRule(String authorization, String ruleName, String topic, String queueUrl) {
+        createRule(authorization, ruleName, topic,
+                "{\"sqs\": {\"roleArn\": \"arn:aws:iam::000000000000:role/iot-rule-role\", \"queueUrl\": \"" + queueUrl + "\"}}");
+    }
+
+    /** A rule selecting every message on {@code topic} into its one {@code action}; {@code cleanup} deletes it. */
+    private void createRule(String authorization, String ruleName, String topic, String action) {
         RequestSpecification request = authorization == null ? given() : given().header("Authorization", authorization);
         request
             .contentType("application/json")
             .body("""
-                {"topicRulePayload": {"sql": "SELECT * FROM '%s'",
-                  "actions": [{"sqs": {"roleArn": "arn:aws:iam::000000000000:role/iot-rule-role", "queueUrl": "%s"}}]}}
-                """.formatted(topic, queueUrl))
+                {"topicRulePayload": {"sql": "SELECT * FROM '%s'", "actions": [%s]}}
+                """.formatted(topic, action))
         .when()
             .put("/rules/" + ruleName)
         .then()
             .statusCode(200);
         cleanup.register(() -> (authorization == null ? given() : given().header("Authorization", authorization))
                 .when().delete("/rules/" + ruleName).then().statusCode(200));
+    }
+
+    private static JsonNode kinesis(String authorization, String action, String body) {
+        String response = given()
+            .header("Authorization", authorization)
+            .header("X-Amz-Target", "Kinesis_20131202." + action)
+            .contentType("application/x-amz-json-1.1")
+            .body(body.getBytes(StandardCharsets.UTF_8))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().asString();
+        try {
+            return OBJECT_MAPPER.readTree(response.isEmpty() ? "{}" : response);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Kinesis " + action + " answered " + response, e);
+        }
+    }
+
+    /** The base64 data of the records on the stream's one shard, once there are any, within five seconds. */
+    private static List<String> awaitKinesisRecords(String authorization, String stream) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (System.currentTimeMillis() < deadline) {
+            String iterator = kinesis(authorization, "GetShardIterator", "{\"StreamName\": \"" + stream
+                    + "\", \"ShardId\": \"shardId-000000000000\", \"ShardIteratorType\": \"TRIM_HORIZON\"}").path("ShardIterator").asText();
+            List<String> data = new ArrayList<>();
+            kinesis(authorization, "GetRecords", "{\"ShardIterator\": \"" + iterator + "\"}").path("Records")
+                    .forEach(item -> data.add(item.path("Data").asText()));
+            if (!data.isEmpty()) {
+                return data;
+            }
+            Thread.sleep(25);
+        }
+        return List.of();
     }
 
     private static List<String> receiveMessages(String queueUrl) {

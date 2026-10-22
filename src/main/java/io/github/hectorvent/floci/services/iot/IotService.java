@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.core.common.CertificateMaterialException;
 import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -1699,10 +1700,20 @@ public class IotService {
             for (IotTopicRule rule : rulesForPublish(region, accountId)) {
                 if (!rule.isRuleDisabled()) {
                     matchAndProject(rule, topic, clientId, eventPayload)
-                            .ifPresent(document -> executeTopicRule(rule, topic, eventPayload, document));
+                            .ifPresent(document -> runAsRuleOwner(rule, () -> executeTopicRule(rule, topic, eventPayload, document)));
                 }
             }
         });
+    }
+
+    /**
+     * Runs a rule's actions as the account that owns the rule, in the rule's region: some actions
+     * find their target by name in the caller's account (a Kinesis stream, a Firehose delivery
+     * stream, a log group), and an MQTT publish's rules run on the broker's worker, outside any request.
+     */
+    private void runAsRuleOwner(IotTopicRule rule, Runnable actions) {
+        RequestScopes.runAs(AwsArnUtils.accountOrDefault(rule.getRuleArn(), config.defaultAccountId()),
+                AwsArnUtils.regionOrDefault(rule.getRuleArn(), config.defaultRegion()), actions);
     }
 
     /**
@@ -1996,7 +2007,6 @@ public class IotService {
             case "dynamoDBv2" -> {
                 String tableName = action.path("putItem").path("tableName").asText(null);
                 if (tableName != null && !tableName.isBlank()) {
-                    // An MQTT publish evaluates rules with no request account, so the write names the rule's owner explicitly.
                     Scope scope = new Scope(
                             AwsArnUtils.accountOrDefault(rule.getRuleArn(), config.defaultAccountId()), region);
                     dynamoDb.items().putItem(scope, tableName, toDynamoDbItem(payload), null, null, null);
