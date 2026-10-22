@@ -269,10 +269,21 @@ public class LambdaExecutorService implements Resettable {
 
         LambdaConcurrencyLimiter.Permit permit = acquire(lambdaService, fn);
         try {
-            return executeSync(fn, payload, requestId, clientContext, invokedQualifier);
+            return withinSyncResponseLimit(executeSync(fn, payload, requestId, clientContext, invokedQualifier));
         } finally {
             permit.close();
         }
+    }
+
+    /**
+     * Every synchronous caller (Invoke, API Gateway, function URLs, event source mappings) gets
+     * AWS's function error for a response over the limit; asynchronous attempts are not checked.
+     */
+    private static InvokeResult withinSyncResponseLimit(InvokeResult result) {
+        byte[] response = result.getPayload();
+        return response != null && response.length > RuntimeApiServer.MAX_SYNC_RESPONSE_BYTES
+                ? RuntimeApiServer.responseSizeTooLarge(result.getRequestId())
+                : result;
     }
 
     private LambdaService resolveLambdaService() {
