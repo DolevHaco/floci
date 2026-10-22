@@ -198,6 +198,13 @@ parameter. Cross-account shared parameters are not modeled. Secrets Manager
 references continue to use `/aws/reference/secretsmanager/<secret-id>`, not a
 parameter ARN.
 
+With IAM enforcement on, a request is checked against the parameters it names, as AWS's
+[parameter retrieval authorization](https://docs.aws.amazon.com/systems-manager/latest/userguide/ps-retrieval-authorization.html)
+describes. `GetParameters` and `DeleteParameters` are checked against each parameter in `Names`, so a
+`Deny` on any one of them refuses the whole call. `GetParametersByPath` is checked against the ARN of
+the path it requests, `parameter/app` for `/app` and `parameter/` for `/`, not against the parameters
+it returns, so a statement naming `/app/secret` does not limit a query of `/app`.
+
 ## Parameter Types
 
 All AWS parameter types are accepted: `String`, `StringList`, `SecureString`.
