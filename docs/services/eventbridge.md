@@ -254,7 +254,7 @@ aws events put-targets \
 
 ## Current Behavior
 
-- An entry's `Time` (epoch seconds, or an ISO 8601 string) becomes the event's `time`; without one, the time of the `PutEvents` call is used. Event times have whole-second precision, as in AWS, and archives and replays use the same time.
+- An entry's `Time` (epoch seconds, or an ISO 8601 string) becomes the event's `time`; without one, the time of the `PutEvents` call is used. Event times have whole-second precision, as in AWS. An archive records that time and `StartReplay` selects archived events by it, but a replayed event is published with the time of the replay rather than its original `time`.
 - `PutEvents` reports success once the source bus accepts an event. Target delivery failures are retried and dead-lettered as described above, and otherwise surface only as a `WARN` in the Floci logs.
 - A `PutEvents` entry for an event bus that does not exist is answered as AWS answers it: with an event id, not counted in `FailedEntryCount`, and dropped, as no rule matches it. Floci logs the drop at `INFO`. Floci's own deliveries to a bus, for a rule, a pipe or a schedule, are unchanged: an entry for a bus that does not exist fails there.
 - A `Detail` forwarded to an event bus must be a JSON object, as in AWS; anything else is dropped, including an `InputPath` selecting a scalar such as `$.detail.orderId` or an envelope carrying `"detail": null`.
