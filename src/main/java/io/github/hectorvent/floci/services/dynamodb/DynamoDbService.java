@@ -410,10 +410,15 @@ public class DynamoDbService {
 
     private void persistItems(String storageKey) {
         if (itemStore == null) return;
-        ConcurrentSkipListMap<String, JsonNode> items = currentItems(storageKey, false);
-        if (items != null) {
-            itemStore.put(storageKey, new HashMap<>(items));
-        } else {
+        // Copying and storing the table under its itemsByTable entry's lock keeps a slower writer
+        // from storing an older copy over a newer one, and holds off DeleteTable, which removes
+        // the entry before it deletes the stored items. The TTL sweep persists the same way.
+        ConcurrentSkipListMap<String, JsonNode> persisted = itemsByTable.computeIfPresent(
+                scopedItemsKey(storageKey), (key, items) -> {
+                    itemStore.put(storageKey, new HashMap<>(items));
+                    return items;
+                });
+        if (persisted == null) {
             itemStore.delete(storageKey);
         }
     }

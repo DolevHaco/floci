@@ -43,6 +43,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -904,6 +905,109 @@ class DynamoDbConcurrencyIntegrationTest {
         assertTrue(errors.isEmpty(), () -> "unexpected errors: " + errors);
         assertTrue(tornReads.isEmpty(),
                 () -> "TransactGetItems saw half-applied transactions (txA/txB versions): " + tornReads);
+    }
+
+    /** An item store whose next put, once armed, parks with its table snapshot until released. */
+    private static final class ParkingItemStore extends InMemoryStorage<String, Map<String, JsonNode>> {
+        private final AtomicBoolean parkNextPut = new AtomicBoolean();
+        private final CountDownLatch parked = new CountDownLatch(1);
+        private final CountDownLatch release = new CountDownLatch(1);
+
+        @Override
+        public void put(String key, Map<String, JsonNode> items) {
+            if (parkNextPut.compareAndSet(true, false)) {
+                parked.countDown();
+                try {
+                    release.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            super.put(key, items);
+        }
+    }
+
+    private static void awaitDoneOrStuck(Future<?> task, Thread thread) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!task.isDone() && System.nanoTime() < deadline) {
+            Thread.State state = thread.getState();
+            if (state == Thread.State.BLOCKED || state == Thread.State.WAITING) {
+                return;
+            }
+            Thread.sleep(1);
+        }
+    }
+
+    /** Runs {@code work} on {@code pool} and returns once it has finished or is stuck behind a lock. */
+    private static Future<?> startAndAwaitDoneOrStuck(ExecutorService pool, Runnable work) throws InterruptedException {
+        CountDownLatch started = new CountDownLatch(1);
+        AtomicReference<Thread> thread = new AtomicReference<>();
+        Future<?> task = pool.submit(() -> {
+            thread.set(Thread.currentThread());
+            started.countDown();
+            work.run();
+        });
+        assertTrue(started.await(10, TimeUnit.SECONDS));
+        awaitDoneOrStuck(task, thread.get());
+        return task;
+    }
+
+    @RepeatedTest(REPEATS)
+    void concurrent_putItem_persists_the_latest_table_snapshot() throws Exception {
+        StorageBackend<String, TableDefinition> tableStore = new InMemoryStorage<>();
+        ParkingItemStore itemStore = new ParkingItemStore();
+        RegionResolver regionResolver = new RegionResolver("us-east-1", "000000000000");
+        service = new DynamoDbService(tableStore, itemStore, regionResolver);
+        createCounterTable("us-east-1");
+        itemStore.parkNextPut.set(true);
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> first = pool.submit(() -> service.putItem("Counters", itemWithPk("a"), "us-east-1"));
+            assertTrue(itemStore.parked.await(10, TimeUnit.SECONDS), "the first write never persisted");
+            Future<?> second = startAndAwaitDoneOrStuck(pool,
+                    () -> service.putItem("Counters", itemWithPk("b"), "us-east-1"));
+            itemStore.release.countDown();
+            first.get(10, TimeUnit.SECONDS);
+            second.get(10, TimeUnit.SECONDS);
+        } finally {
+            itemStore.release.countDown();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS), "thread pool did not terminate");
+        }
+
+        assertEquals(2, itemStore.get("us-east-1::Counters").orElseThrow().size(),
+                () -> "the stored table must hold both items: " + itemStore.get("us-east-1::Counters"));
+        DynamoDbService restarted = new DynamoDbService(tableStore, itemStore, regionResolver);
+        assertNotNull(restarted.getItem("Counters", pkKey("a"), "us-east-1"));
+        assertNotNull(restarted.getItem("Counters", pkKey("b"), "us-east-1"),
+                "a write that finished must survive a restart");
+    }
+
+    @RepeatedTest(REPEATS)
+    void putItem_persist_racing_deleteTable_does_not_bring_the_items_back() throws Exception {
+        StorageBackend<String, TableDefinition> tableStore = new InMemoryStorage<>();
+        ParkingItemStore itemStore = new ParkingItemStore();
+        service = new DynamoDbService(tableStore, itemStore, new RegionResolver("us-east-1", "000000000000"));
+        createCounterTable("us-east-1");
+        itemStore.parkNextPut.set(true);
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> write = pool.submit(() -> service.putItem("Counters", itemWithPk("a"), "us-east-1"));
+            assertTrue(itemStore.parked.await(10, TimeUnit.SECONDS), "the write never persisted");
+            Future<?> delete = startAndAwaitDoneOrStuck(pool, () -> service.deleteTable("Counters", "us-east-1"));
+            itemStore.release.countDown();
+            write.get(10, TimeUnit.SECONDS);
+            delete.get(10, TimeUnit.SECONDS);
+        } finally {
+            itemStore.release.countDown();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS), "thread pool did not terminate");
+        }
+
+        assertTrue(itemStore.get("us-east-1::Counters").isEmpty(),
+                () -> "a deleted table's items must not be stored again: " + itemStore.get("us-east-1::Counters"));
     }
 
     @Test
