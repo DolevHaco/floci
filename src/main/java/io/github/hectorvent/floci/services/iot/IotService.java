@@ -56,6 +56,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.cert.CertificateEncodingException;
 import java.security.cert.X509Certificate;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -95,6 +96,7 @@ public class IotService {
     /** The {@code FirehoseSeparator} shape of the IoT API model. */
     private static final Pattern FIREHOSE_SEPARATOR = Pattern.compile("([\\n\\t])|(\\r\\n)|(,)");
     public static final int MAX_POLICY_VERSIONS = 5;
+    private static final Duration DELETED_SHADOW_VERSION_RETENTION = Duration.ofHours(48);
 
     /** One lock for every policy version write and the policy delete, so a cap check, an append and a delete cannot interleave. */
     private final Object policyWriteLock = new Object();
@@ -931,7 +933,7 @@ public class IotService {
      * one, the stored metadata, the version and the current time. Publishes nothing.
      */
     public JsonNode getThingShadow(String thingName, String shadowName, String region) {
-        IotShadow shadow = shadowStore.get(shadowKey(region, thingName, shadowName))
+        IotShadow shadow = liveShadow(shadowKey(region, thingName, shadowName))
                 .orElseThrow(() -> shadowNotFound(thingName));
         ObjectNode document = storedShadowDocument(shadow);
         ObjectNode state = (ObjectNode) document.get("state");
@@ -975,14 +977,22 @@ public class IotService {
         return deleteThingShadow(thingName, shadowName, null, region, Runnable::run);
     }
 
-    /** Deletes the shadow and returns the delete/accepted document after publishing it. */
+    /**
+     * Deletes the shadow and returns the delete/accepted document after publishing it. Its version
+     * is kept, see {@link #deletedVersion}.
+     */
     JsonNode deleteThingShadow(String thingName, String shadowName, String clientToken, String region,
                                Executor ruleRunner) {
         ObjectNode accepted = objectMapper.createObjectNode();
         synchronized (shadowWriteLock) {
             String key = shadowKey(region, thingName, shadowName);
-            IotShadow shadow = shadowStore.get(key).orElseThrow(() -> shadowNotFound(thingName));
-            shadowStore.delete(key);
+            IotShadow shadow = liveShadow(key).orElseThrow(() -> shadowNotFound(thingName));
+            IotShadow deleted = new IotShadow();
+            deleted.setThingName(shadow.getThingName());
+            deleted.setShadowName(shadow.getShadowName());
+            deleted.setVersion(shadow.getVersion());
+            deleted.setDeletedAt(Instant.now());
+            shadowStore.put(key, deleted);
             accepted.put("version", shadow.getVersion());
         }
         accepted.put("timestamp", Instant.now().getEpochSecond());
@@ -995,7 +1005,8 @@ public class IotService {
     /** The read-modify-write of one update; the caller holds {@link #shadowWriteLock}. */
     private ShadowUpdate writeShadowUpdate(String thingName, String shadowName, JsonNode request, String region) {
         String key = shadowKey(region, thingName, shadowName);
-        IotShadow existing = shadowStore.get(key).orElse(null);
+        IotShadow stored = shadowStore.get(key).orElse(null);
+        IotShadow existing = stored == null || stored.getDeletedAt() != null ? null : stored;
         long currentVersion = existing == null ? 0 : existing.getVersion();
         if (request.hasNonNull("version") && request.path("version").asLong() != currentVersion) {
             throw new AwsException("ConflictException", "Version conflict", 409);
@@ -1009,7 +1020,7 @@ public class IotService {
         JsonNode requestState = request.path("state");
         mergeShadowSection(state, metadata, "desired", requestState.path("desired"), timestamp);
         mergeShadowSection(state, metadata, "reported", requestState.path("reported"), timestamp);
-        long version = currentVersion + 1;
+        long version = (existing == null ? deletedVersion(stored) : currentVersion) + 1;
         document.put("version", version);
         document.put("timestamp", timestamp);
 
@@ -1054,6 +1065,23 @@ public class IotService {
 
     private AwsException shadowNotFound(String thingName) {
         return new AwsException("ResourceNotFoundException", "Shadow not found: " + thingName, 404);
+    }
+
+    /** The shadow stored under {@code key}, unless it was deleted. */
+    private Optional<IotShadow> liveShadow(String key) {
+        return shadowStore.get(key).filter(shadow -> shadow.getDeletedAt() == null);
+    }
+
+    /**
+     * The version a shadow created again continues from: as on AWS, the deleted shadow's when it
+     * was deleted less than 48 hours ago, otherwise 0.
+     */
+    private static long deletedVersion(IotShadow deleted) {
+        if (deleted == null || deleted.getDeletedAt() == null
+                || deleted.getDeletedAt().isBefore(Instant.now().minus(DELETED_SHADOW_VERSION_RETENTION))) {
+            return 0;
+        }
+        return deleted.getVersion();
     }
 
     private ObjectNode emptyShadowDocument() {
@@ -1163,6 +1191,7 @@ public class IotService {
     public List<String> listNamedShadowsForThing(String thingName, String region) {
         String prefix = "shadow:" + region + ":" + thingName + ":";
         return shadowStore.scan(key -> key.startsWith(prefix)).stream()
+                .filter(shadow -> shadow.getDeletedAt() == null)
                 .map(IotShadow::getShadowName)
                 .filter(name -> name != null && !name.isBlank())
                 .sorted()
