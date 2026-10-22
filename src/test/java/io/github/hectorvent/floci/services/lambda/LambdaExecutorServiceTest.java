@@ -183,6 +183,84 @@ class LambdaExecutorServiceTest {
     }
 
     @Test
+    void coldStart_initLongerThanTheFunctionTimeout_stillRunsWithinTheInitPhase() {
+        // AWS gives the Init phase 10 seconds, however short the function timeout (1 s here) is.
+        // The budget is init-timeout-seconds, counted from the container start, and the wait is
+        // the longer of what remains of it and the timeout plus the dispatch grace.
+        LambdaExecutorService coldExecutor = registerExecutor(
+                new LambdaExecutorService(warmPool, new ObjectMapper(), concurrencyLimiter, 10));
+        RuntimeApiServer rtas = coldRuntime(false);
+        ContainerHandle handle = new ContainerHandle("cid-cold", "test-fn", rtas, ContainerState.COLD);
+        when(warmPool.acquire(any())).thenReturn(handle);
+        doAnswer(inv -> {
+            PendingInvocation pi = inv.getArgument(0);
+            CompletableFuture.delayedExecutor(4, TimeUnit.SECONDS).execute(() -> {
+                pi.prepareForDispatch();
+                pi.markDispatched();
+                pi.getResultFuture().complete(
+                        new InvokeResult(200, null, "{\"ok\":true}".getBytes(), null, pi.getRequestId()));
+            });
+            return pi.getResultFuture();
+        }).when(rtas).enqueue(any(PendingInvocation.class));
+
+        InvokeResult result = coldExecutor.invoke(fn, "{}".getBytes(), InvocationType.RequestResponse);
+
+        assertNull(result.getFunctionError(), () -> new String(result.getPayload()));
+        verify(warmPool).release(handle);
+        verify(warmPool, never()).destroyHandle(handle);
+    }
+
+    @Test
+    void coldStart_whoseRuntimeNeverTakesTheInvocation_timesOutAfterTheInitPhase() {
+        // 5 s is longer than the 1 s timeout plus the 2 s grace, so the wait is the Init budget.
+        LambdaExecutorService shortInit = registerExecutor(
+                new LambdaExecutorService(warmPool, new ObjectMapper(), concurrencyLimiter, 5));
+        RuntimeApiServer rtas = coldRuntime(false);
+        ContainerHandle handle = new ContainerHandle("cid-cold-stuck", "test-fn", rtas, ContainerState.COLD);
+        when(warmPool.acquire(any())).thenReturn(handle);
+        when(rtas.enqueue(any())).thenReturn(new CompletableFuture<>());
+
+        long started = System.nanoTime();
+        InvokeResult result = shortInit.invoke(fn, "{}".getBytes(), InvocationType.RequestResponse);
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+        // A runtime that has already polled gives up after the 1 s timeout plus the 2 s grace.
+        assertTrue(elapsedMs >= 4900, "waited only " + elapsedMs + " ms for the Init phase");
+        assertTrue(new String(result.getPayload()).contains("Function.TimedOut"));
+        verify(warmPool).destroyHandle(handle);
+        verify(warmPool, never()).release(handle);
+    }
+
+    @Test
+    void runtimeThatHasPolled_timesOutAtTheFunctionTimeoutNotTheInitBudget() {
+        // Once the runtime has polled /next, the Init budget no longer applies.
+        LambdaExecutorService withBudget = registerExecutor(
+                new LambdaExecutorService(warmPool, new ObjectMapper(), concurrencyLimiter, 10));
+        RuntimeApiServer rtas = coldRuntime(true);
+        ContainerHandle handle = new ContainerHandle("cid-polled", "test-fn", rtas, ContainerState.WARM);
+        when(warmPool.acquire(any())).thenReturn(handle);
+        when(rtas.enqueue(any())).thenReturn(new CompletableFuture<>());
+
+        long started = System.nanoTime();
+        InvokeResult result = withBudget.invoke(fn, "{}".getBytes(), InvocationType.RequestResponse);
+        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+        assertTrue(elapsedMs >= 2500 && elapsedMs < 8000,
+                "a runtime that has already polled waited " + elapsedMs
+                        + " ms; that wait is the timeout plus grace, about 3 s");
+        assertTrue(new String(result.getPayload()).contains("Function.TimedOut"));
+        verify(warmPool).destroyHandle(handle);
+        verify(warmPool, never()).release(handle);
+    }
+
+    private static RuntimeApiServer coldRuntime(boolean hasPolled) {
+        RuntimeApiServer rtas = mock(RuntimeApiServer.class);
+        when(rtas.hasRuntimePolled()).thenReturn(hasPolled);
+        when(rtas.getContainerStartedAtMs()).thenReturn(0L);
+        return rtas;
+    }
+
+    @Test
     void syncInvoke_clientContext_isPlacedOnTheEnqueuedInvocation() {
         RuntimeApiServer rtas = mock(RuntimeApiServer.class);
         ContainerHandle handle = new ContainerHandle("cid-ctx", "test-fn", rtas, ContainerState.WARM);
@@ -578,9 +656,8 @@ class LambdaExecutorServiceTest {
         AsyncInvokeDestinationRouter router = mock(AsyncInvokeDestinationRouter.class);
         LambdaService lambdaService = eventInvokeConfig(2, 21600);
         when(lambdaService.findLatest(fn)).thenReturn(Optional.of(fn));
-        LambdaExecutorService zeroExecutor = new LambdaExecutorService(warmPool, new ObjectMapper(),
-                new LambdaConcurrencyLimiter(), router, lambdaService, Clock.systemUTC(), Duration.ZERO);
-        retryExecutors.add(zeroExecutor);
+        LambdaExecutorService zeroExecutor = registerExecutor(new LambdaExecutorService(warmPool, new ObjectMapper(),
+                new LambdaConcurrencyLimiter(), router, lambdaService, Clock.systemUTC(), Duration.ZERO));
         CountDownLatch routed = countRoutes(router);
 
         byte[] payload = "{}".getBytes();
