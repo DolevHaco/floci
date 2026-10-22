@@ -293,6 +293,7 @@ public class IotService {
         return paginate(listThings(region), maxResults, nextToken);
     }
 
+    /** Replaces the thing's attributes with {@code attributes}, as a CloudFormation update does, and keeps its thing type. */
     public Thing updateThing(String thingName, Map<String, String> attributes, Long expectedVersion, String region) {
         return updateThing(thingName, attributes, false, null, false, expectedVersion, region);
     }
@@ -1347,12 +1348,23 @@ public class IotService {
                 .toList(), maxResults, nextToken);
     }
 
+    /**
+     * The attributes change only when the attribute payload carries some, and with {@code merge}
+     * they are merged as {@link #updateThing} merges a thing's.
+     */
     public IotThingGroup updateThingGroup(String thingGroupName, JsonNode properties, Long expectedVersion, String region) {
         IotThingGroup group = describeThingGroup(thingGroupName, region);
         if (expectedVersion != null && group.getVersion() != expectedVersion) {
             throw new AwsException("VersionConflictException", "Thing group version does not match expectedVersion", 409);
         }
-        updateThingGroupProperties(group, properties);
+        group.setDescription(properties.path("thingGroupDescription").asText(null));
+        JsonNode attributePayload = properties.path("attributePayload");
+        if (attributePayload.path("attributes").isObject()) {
+            Map<String, String> attributes = parseAttributePayload(attributePayload);
+            group.setAttributes(attributePayload.path("merge").asBoolean(false)
+                    ? mergedAttributes(group.getAttributes(), attributes)
+                    : attributes);
+        }
         group.setVersion(group.getVersion() + 1);
         thingGroupStore.put(thingGroupKey(region, thingGroupName), group);
         return group;
@@ -2313,6 +2325,19 @@ public class IotService {
             attributesNode.fields().forEachRemaining(entry -> attributes.put(entry.getKey(), entry.getValue().asText()));
         }
         return attributes;
+    }
+
+    /** {@code stored} with {@code update} merged in, as AWS's {@code AttributePayload.merge}: an empty value removes the attribute. */
+    private static Map<String, String> mergedAttributes(Map<String, String> stored, Map<String, String> update) {
+        Map<String, String> merged = new TreeMap<>(stored == null ? Map.of() : stored);
+        update.forEach((name, value) -> {
+            if (value == null || value.isEmpty()) {
+                merged.remove(name);
+            } else {
+                merged.put(name, value);
+            }
+        });
+        return merged;
     }
 
     private String blankToNull(String value) {
