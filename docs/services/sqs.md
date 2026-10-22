@@ -106,6 +106,12 @@ A message older than the queue's `MessageRetentionPeriod` is no longer returned 
 
 `CreateQueue` and `SetQueueAttributes` reject a `MessageRetentionPeriod` outside 60 to 1209600 seconds with `InvalidAttributeValue`.
 
+## Dead-Letter Queues
+
+`CreateQueue` and `SetQueueAttributes` validate a `RedrivePolicy` as AWS does and reject it with `InvalidParameterValue` when it is not a JSON object holding `deadLetterTargetArn` and `maxReceiveCount`, when `maxReceiveCount` is outside 1 to 1000, when the dead-letter queue does not exist in the source queue's account and region, when one queue is FIFO and the other standard, or when the dead-letter queue's `RedriveAllowPolicy` (`denyAll`, or `byQueue` without the source queue's ARN) does not admit the source. Create the dead-letter queue first: an init script that creates the source queue before its dead-letter queue fails, as it does on AWS.
+
+If the dead-letter queue is deleted after the policy was set, messages that exceed `maxReceiveCount` stay in the source queue and keep being delivered.
+
 ## CloudWatch Metrics
 
 Floci publishes the `AWS/SQS` metrics of every active queue to CloudWatch once a minute, on the single `QueueName` dimension, as SQS does. Each publication runs just after a minute boundary and is stamped with the minute that ended, so a call counts in the minute it was made. Alarms, `GetMetricData`, `GetMetricStatistics` and `ListMetrics` see them with no `PutMetricData`. A queue is active while it holds a message, and for six hours after `CreateQueue`, `SendMessage`, `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility`, `PurgeQueue`, `GetQueueAttributes` or `SetQueueAttributes` on it, batch forms included. Publication stops when `FLOCI_SERVICES_SQS_CLOUDWATCH_METRICS_ENABLED` is `false` or the CloudWatch Metrics service is disabled.
