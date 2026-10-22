@@ -866,7 +866,7 @@ class KinesisIntegrationTest {
 
     @Test
     @Order(46)
-    void putRecordPreservesShardForNegativeHashCode() throws Exception {
+    void putRecordRoutesAKeyWithANegativeHashCodeToTheShardCoveringItsMd5HashKey() throws Exception {
         given()
             .header("X-Amz-Target", "Kinesis_20131202.CreateStream")
             .contentType(KINESIS_CONTENT_TYPE)
