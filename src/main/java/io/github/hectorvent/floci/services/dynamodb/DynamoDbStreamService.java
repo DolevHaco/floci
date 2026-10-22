@@ -76,6 +76,10 @@ public class DynamoDbStreamService {
 
     DynamoDbStreamService(ObjectMapper objectMapper, StorageBackend<String, TableDefinition> tableStore,
                           int maxRecords) {
+        if (maxRecords < 1) {
+            throw new IllegalArgumentException(
+                    "floci.services.dynamodb.streams-max-records must be at least 1, got " + maxRecords);
+        }
         this.objectMapper = objectMapper;
         this.maxRecords = maxRecords;
         loadPersistedStreams(tableStore);

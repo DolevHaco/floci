@@ -461,6 +461,16 @@ class DynamoDbStreamServiceTest {
     }
 
     @Test
+    void rejectsAStreamsMaxRecordsBelowOne() {
+        for (int maxRecords : new int[]{0, -1}) {
+            IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                    () -> new DynamoDbStreamService(mapper, storage, maxRecords));
+            assertEquals("floci.services.dynamodb.streams-max-records must be at least 1, got " + maxRecords,
+                    error.getMessage());
+        }
+    }
+
+    @Test
     void trimmingRecordsNoConsumerHasReadLogsAWarningWithTheCount() throws Exception {
         DynamoDbStreamService capped = new DynamoDbStreamService(mapper, storage, 3);
         TableDefinition table = sharedNameTable(ACCOUNT_A);
