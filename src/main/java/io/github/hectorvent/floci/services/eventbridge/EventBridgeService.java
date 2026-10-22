@@ -50,6 +50,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -1007,7 +1008,8 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
             }
 
             String eventId = UUID.randomUUID().toString();
-            ObjectNode envelope = eventEnvelope(entry, eventId, region, accountId);
+            Instant eventTime = eventTime(entry);
+            ObjectNode envelope = eventEnvelope(entry, eventId, eventTime, region, accountId);
             String eventJson = null;
             String rulePrefix = ruleKeyPrefix(region, effectiveBus);
             List<Rule> candidateRules = accountScan(ruleStore, accountId, k -> k.startsWith(rulePrefix));
@@ -1033,7 +1035,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                 }
             }
 
-            captureToArchives(entry, envelope, busStoreKey, eventId, region, accountId);
+            captureToArchives(entry, envelope, busStoreKey, eventId, eventTime, region, accountId);
 
             Map<String, String> successEntry = new HashMap<>();
             successEntry.put("EventId", eventId);
@@ -1106,7 +1108,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         if (eventPattern == null || eventPattern.isBlank()) {
             return true;
         }
-        return matchesPattern(eventEnvelope(event, null, null, null), eventPattern);
+        return matchesPattern(eventEnvelope(event, null, eventTime(event), null, null), eventPattern);
     }
 
     private boolean matchesPattern(JsonNode envelope, String eventPattern) {
@@ -1129,7 +1131,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
      * The event envelope for an entry, which rules and archives are matched against. A missing or
      * non-array {@code Resources} is an empty list, as every AWS event carries one.
      */
-    private ObjectNode eventEnvelope(Map<String, Object> entry, String eventId,
+    private ObjectNode eventEnvelope(Map<String, Object> entry, String eventId, Instant time,
                                      String callRegion, String callAccountId) {
         // Envelope region/account precedence: entry-supplied "Region"/"Account" (set by
         // archive replay paths and cross-region producers) wins; otherwise stamp the
@@ -1151,7 +1153,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         node.put("source", entry.get("Source") instanceof String source ? source : "");
         node.put("detail-type", entry.get("DetailType") instanceof String detailType ? detailType : "");
         node.put("account", envelopeAccount);
-        node.put("time", Instant.now().toString());
+        node.put("time", time.toString());
         node.put("region", envelopeRegion);
         ArrayNode resources = node.putArray("resources");
         if (entry.get("Resources") instanceof ArrayNode entryResources) {
@@ -1159,6 +1161,15 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         }
         node.set("detail", detailNode(entry.get("Detail")));
         return node;
+    }
+
+    /**
+     * The entry's {@code Time} when the caller supplied one, otherwise now. Event times carry whole
+     * seconds, as in the RFC 3339 timestamps AWS puts on events.
+     */
+    private static Instant eventTime(Map<String, Object> entry) {
+        Instant time = entry.get("Time") instanceof Instant entryTime ? entryTime : Instant.now();
+        return time.truncatedTo(ChronoUnit.SECONDS);
     }
 
     private JsonNode detailNode(Object detail) {
@@ -1819,7 +1830,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
     }
 
     private void captureToArchives(Map<String, Object> entry, JsonNode envelope, String busStoreKey,
-                                   String eventId, String region, String accountId) {
+                                   String eventId, Instant eventTime, String region, String accountId) {
         EventBus bus = accountGet(busStore, accountId, busStoreKey).orElse(null);
         if (bus == null) {
             return;
@@ -1839,7 +1850,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                         accountGet(archivedEventStore, accountId, evKey).orElse(new ArrayList<>()));
                 ArchivedEvent ae = new ArchivedEvent(
                         eventId,
-                        Instant.now(),
+                        eventTime,
                         (String) entry.get("Source"),
                         (String) entry.get("DetailType"),
                         (String) entry.get("Detail"),
