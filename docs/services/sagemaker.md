@@ -42,7 +42,7 @@ Floci emulates SageMaker control-plane APIs and runs real Docker containers for 
 
 ## Training contract
 
-`CreateTrainingJob` starts `AlgorithmSpecification.TrainingImage` with command `train` unless `ContainerEntrypoint`/`ContainerArguments` are supplied. Floci writes SageMaker config files under `/opt/ml/input/config`, downloads every object under each channel's `S3Uri` prefix into `/opt/ml/input/data/<channel>` (keeping the folder structure below the prefix and skipping zero-byte folder-marker keys that end in `/`), waits for container exit, and uploads `/opt/ml/model` as `model.tar.gz` under `OutputDataConfig.S3OutputPath/<TrainingJobName>/output/`.
+`CreateTrainingJob` starts `AlgorithmSpecification.TrainingImage` with command `train` unless `ContainerEntrypoint`/`ContainerArguments` are supplied. Floci writes SageMaker config files under `/opt/ml/input/config`, downloads every object under each channel's `S3Uri` prefix into `/opt/ml/input/data/<channel>` (keeping the folder structure below the prefix and skipping zero-byte folder-marker keys that end in `/`), waits for container exit, and uploads `/opt/ml/model` as `model.tar.gz` under `OutputDataConfig.S3OutputPath/<TrainingJobName>/output/`. Channel downloads, the artifact upload, and the `/aws/sagemaker/TrainingJobs` log stream use the account that created the job.
 
 ## GPU-backed training
 
@@ -82,7 +82,7 @@ Only the accelerator is substituted. An instance type also implies vCPU and memo
 
 ## Endpoint hosting
 
-`CreateEndpoint` starts the model image as a long-lived Docker container with command `serve`, port `8080`, `/ping` health checks, and `/invocations` runtime proxying. `ModelDataUrl` artifacts are downloaded from S3 and placed in `/opt/ml/model`.
+`CreateEndpoint` starts the model image as a long-lived Docker container with command `serve`, port `8080`, `/ping` health checks, and `/invocations` runtime proxying. `ModelDataUrl` artifacts are downloaded from S3 in the account that created the endpoint and placed in `/opt/ml/model`.
 
 Endpoint containers are CPU-only for now; the `gpu` settings above apply to training jobs.
 

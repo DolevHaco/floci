@@ -7,6 +7,7 @@ import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.core.command.LogContainerResultCallback;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -85,7 +86,7 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
     }
 
     void runAsync(TrainingJobResource job, SageMakerService service, long backoffMillis) {
-        executor.submit(() -> run(job, service, backoffMillis));
+        executor.submit(() -> RequestScopes.runAs(job.accountId, job.region, () -> run(job, service, backoffMillis)));
     }
 
     private void run(TrainingJobResource job, SageMakerService service, long backoffMillis) {
@@ -116,8 +117,8 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
             job.trainingStartTime = System.currentTimeMillis();
             job.secondaryStatus = "Training";
             service.updateTrainingJob(job);
-            logs = logStreamer.attach(containerId, LOG_GROUP, job.trainingJobName + "/algo-1", job.region,
-                    "sagemaker:" + job.trainingJobName);
+            logs = logStreamer.attachForAccount(job.accountId, containerId, LOG_GROUP, job.trainingJobName + "/algo-1",
+                    job.region, "sagemaker:" + job.trainingJobName);
             Integer exit = waitForExit(containerId, timeout(job));
             if (stopRequested.remove(job.trainingJobName)) {
                 // stop() already persisted Stopped and is tearing the container down itself;

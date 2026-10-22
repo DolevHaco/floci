@@ -4,6 +4,7 @@ import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.model.Event;
 import com.github.dockerjava.api.model.EventType;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.github.hectorvent.floci.testing.TestImages;
@@ -30,6 +31,7 @@ import static io.restassured.RestAssured.given;
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -39,6 +41,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class SageMakerDockerIntegrationTest {
     private static final String AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20260205/us-east-1/sagemaker/aws4_request";
+    private static final String OTHER_ACCOUNT = "111111111111";
+    private static final String OTHER_ACCOUNT_AUTH =
+            "AWS4-HMAC-SHA256 Credential=" + OTHER_ACCOUNT + "/20260205/us-east-1/sagemaker/aws4_request";
 
     @Inject DockerClient dockerClient;
     @Inject S3Service s3Service;
@@ -81,6 +86,40 @@ class SageMakerDockerIntegrationTest {
                 .extract().path("ModelArtifacts.S3ModelArtifacts");
         S3Uri uri = S3Uri.parse(artifact);
         assertNotNull(s3Service.getObject(uri.bucket(), uri.key()).getData());
+    }
+
+    @Test
+    void trainingJobInAnotherAccountReadsAndWritesThatAccountsBucket() throws Exception {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String bucket = "sm-acct-train-" + suffix;
+        RequestScopes.runAs(OTHER_ACCOUNT, () -> {
+            s3Service.createBucket(bucket, "us-east-1");
+            s3Service.putObject(bucket, "input/data.txt", "hello".getBytes(StandardCharsets.UTF_8), "text/plain", Map.of());
+        });
+        String job = "sm-acct-train-" + suffix;
+        post(OTHER_ACCOUNT_AUTH, "SageMaker.CreateTrainingJob", """
+                {
+                  "TrainingJobName":"%s",
+                  "AlgorithmSpecification":{
+                    "TrainingImage":"%s",
+                    "ContainerEntrypoint":["/bin/sh","-c"],
+                    "ContainerArguments":["mkdir -p /opt/ml/model && cp /opt/ml/input/data/train/data.txt /opt/ml/model/model.txt"]
+                  },
+                  "InputDataConfig":[{"ChannelName":"train","DataSource":{"S3DataSource":{"S3Uri":"s3://%s/input"}},"ContentType":"text/plain","TrainingInputMode":"File"}],
+                  "OutputDataConfig":{"S3OutputPath":"s3://%s/output"},
+                  "ResourceConfig":{"InstanceType":"ml.m5.large","InstanceCount":1,"VolumeSizeInGB":1},
+                  "StoppingCondition":{"MaxRuntimeInSeconds":60}
+                }
+                """.formatted(job, TestImages.BUSYBOX, bucket, bucket)).then().statusCode(200);
+
+        String status = awaitTerminalStatus("Completed", () -> post(OTHER_ACCOUNT_AUTH, "SageMaker.DescribeTrainingJob",
+                "{\"TrainingJobName\":\"%s\"}".formatted(job)).then().statusCode(200).extract().path("TrainingJobStatus"));
+        assertEquals("Completed", status, () -> post(OTHER_ACCOUNT_AUTH, "SageMaker.DescribeTrainingJob",
+                "{\"TrainingJobName\":\"%s\"}".formatted(job)).then().extract().path("FailureReason"));
+        String artifact = post(OTHER_ACCOUNT_AUTH, "SageMaker.DescribeTrainingJob", "{\"TrainingJobName\":\"%s\"}".formatted(job))
+                .then().statusCode(200).extract().path("ModelArtifacts.S3ModelArtifacts");
+        S3Uri uri = S3Uri.parse(artifact);
+        assertNotNull(RequestScopes.callAs(OTHER_ACCOUNT, () -> s3Service.getObject(uri.bucket(), uri.key())).getData());
     }
 
     @Test
@@ -238,7 +277,11 @@ class SageMakerDockerIntegrationTest {
     }
 
     private Response post(String target, String body) {
-        return given().header("Authorization", AUTH).header("X-Amz-Target", target)
+        return post(AUTH, target, body);
+    }
+
+    private Response post(String auth, String target, String body) {
+        return given().header("Authorization", auth).header("X-Amz-Target", target)
                 .contentType("application/x-amz-json-1.1").body(body).when().post("/");
     }
 

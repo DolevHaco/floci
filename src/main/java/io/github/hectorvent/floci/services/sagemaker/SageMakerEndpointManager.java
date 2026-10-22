@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.sagemaker;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -75,7 +76,8 @@ public class SageMakerEndpointManager implements ContainerTeardown, Resettable {
     }
 
     void startEndpointAsync(EndpointResource endpoint, SageMakerService service, long backoffMillis) {
-        executor.submit(() -> startEndpoint(endpoint, service, backoffMillis));
+        executor.submit(() -> RequestScopes.runAs(endpoint.accountId, endpoint.region,
+                () -> startEndpoint(endpoint, service, backoffMillis)));
     }
 
     private void startEndpoint(EndpointResource endpoint, SageMakerService service, long backoffMillis) {
