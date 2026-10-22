@@ -32,7 +32,7 @@ Containers are named `floci-aws-sagemaker-endpoint-<account>-<region>-<name>` an
 | `DescribeEndpoint` | Returns an endpoint's status, scoped to the calling region. |
 | `DeleteEndpoint` | Stops and removes the endpoint's container; a start still in flight for this endpoint discards its result instead of resurrecting the deleted record. |
 | `ListEndpoints` | Lists endpoints for the calling region; supports `MaxResults` and `NextToken`. |
-| `UpdateEndpoint` | Swaps an endpoint to a new endpoint configuration, restarting its container; a superseded in-flight start discards its result. |
+| `UpdateEndpoint` | Swaps an endpoint to a new endpoint configuration by restarting its container, reporting `Creating` until the new container is `InService` (see [Endpoint hosting](#endpoint-hosting)); a superseded in-flight start discards its result. |
 | `CreateTrainingJob` | Runs `AlgorithmSpecification.TrainingImage` asynchronously against the `/opt/ml` contract and uploads the resulting model artifacts to S3. |
 | `DescribeTrainingJob` | Returns a training job's status, scoped to the calling region. |
 | `ListTrainingJobs` | Lists training jobs for the calling region; supports `NameContains`, `StatusEquals`, `MaxResults`, and `NextToken`. |
@@ -89,6 +89,8 @@ Only the accelerator is substituted. An instance type also implies vCPU and memo
 `CreateEndpoint` starts the model image as a long-lived Docker container with command `serve`, port `8080`, `/ping` health checks, and `/invocations` runtime proxying. A 4xx or 5xx response from the container is returned as a `ModelError` (HTTP 424) carrying the container's `OriginalStatusCode` and `OriginalMessage`. `ModelDataUrl` artifacts are downloaded from S3 in the account that created the endpoint and placed in `/opt/ml/model`.
 
 Endpoint containers are CPU-only for now; the `gpu` settings above apply to training jobs.
+
+`UpdateEndpoint` is simplified. AWS switches to the new endpoint configuration without downtime; Floci stops the current container and starts one for the new configuration. Until the new container passes its `/ping` check, `DescribeEndpoint` reports `EndpointStatus` `Creating` (AWS reports `Updating`) and `InvokeEndpoint` is rejected because the endpoint is not `InService`. If the new container fails to start, the endpoint becomes `Failed` with no container serving it, whereas AWS keeps serving the previous endpoint configuration.
 
 ## Examples
 
