@@ -114,6 +114,11 @@ DynamoDB Streams are supported via a separate target (`DynamoDBStreams_20120810`
 | `GetShardIterator` | Get a shard iterator |
 | `GetRecords` | Read stream records from a shard |
 
+As in AWS, a `PutItem` or `UpdateItem` that leaves the item unchanged writes no stream record. Numbers
+compare by value and sets by membership, so rewriting `1.0` as `1` or reordering a set is not a
+change. A [Kinesis streaming destination](#kinesis-change-data-capture-cdc) still receives a `MODIFY`
+record for such a write.
+
 Redshift zero-ETL integrations can consume these stream records directly. See the
 [Redshift DynamoDB zero-ETL](redshift.md#dynamodb-zero-etl) section for the supported target,
 landing table, checkpoint, and retry behavior.

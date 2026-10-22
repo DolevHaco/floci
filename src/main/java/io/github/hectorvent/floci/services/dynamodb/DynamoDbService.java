@@ -1151,12 +1151,13 @@ public class DynamoDbService {
             LOG.tracev("Put item in {0}: key={1} item={2}", canonicalTableName, itemKey, item);
 
             String eventName = existing == null ? "INSERT" : "MODIFY";
+            boolean unchanged = existing != null && sameItem(existing, normalizedItem);
             // Captured in request scope on purpose: this event may be deferred to the batch drain,
             // and resolving the account inside the lambda would fall back to the default account,
             // which is the ambient-account bug this commit exists to remove.
             String ownerAccountId = regionResolver.getAccountId();
             Runnable streamEvent = () -> {
-                if (streamService != null) {
+                if (streamService != null && !unchanged) {
                     streamService.captureEvent(eventName, existing, item, table, region);
                 }
                 if (kinesisForwarder != null) {
@@ -1512,8 +1513,9 @@ public class DynamoDbService {
             // which is the ambient-account bug this commit exists to remove.
             String ownerAccountId = regionResolver.getAccountId();
             String eventName = existing == null ? "INSERT" : "MODIFY";
+            boolean unchanged = existing != null && sameItem(existing, item);
             Runnable streamEvent = () -> {
-                if (streamService != null) {
+                if (streamService != null && !unchanged) {
                     streamService.captureEvent(eventName, existing, item, table, region);
                 }
                 if (kinesisForwarder != null) {
@@ -4299,6 +4301,23 @@ public class DynamoDbService {
 
     private boolean attributeValuesEqual(JsonNode a, JsonNode b) {
         return ExpressionEvaluator.attributeValuesEqual(a, b);
+    }
+
+    // DynamoDB Streams writes no record for a PutItem or UpdateItem that leaves the item as it was.
+    // Numbers compare by value and sets by membership, so neither a rewritten number nor a
+    // reordered set counts as a change.
+    private static boolean sameItem(JsonNode a, JsonNode b) {
+        if (a.size() != b.size()) {
+            return false;
+        }
+        Iterator<Map.Entry<String, JsonNode>> fields = a.fields();
+        while (fields.hasNext()) {
+            Map.Entry<String, JsonNode> field = fields.next();
+            if (!ExpressionEvaluator.attributeValuesEqual(field.getValue(), b.get(field.getKey()))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
