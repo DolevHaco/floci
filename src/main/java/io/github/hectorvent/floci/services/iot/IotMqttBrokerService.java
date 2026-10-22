@@ -52,6 +52,7 @@ import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -375,6 +376,7 @@ public class IotMqttBrokerService implements Resettable {
         return server != null;
     }
 
+    /** A message Floci itself publishes, such as a shadow response or a republish, delivered at QoS 0. */
     void publish(String topic, byte[] payload) {
         publish(topic, payload, 0);
     }
@@ -441,9 +443,9 @@ public class IotMqttBrokerService implements Resettable {
         }
     }
 
-    List<String> listSubscriptions(String clientId) {
-        return subscriptionsByClient.getOrDefault(clientId, Map.of()).keySet().stream()
-                .sorted()
+    List<Subscription> listSubscriptions(String clientId) {
+        return subscriptionsByClient.getOrDefault(clientId, Map.of()).values().stream()
+                .sorted(Comparator.comparing(Subscription::topicFilter))
                 .toList();
     }
 
@@ -1059,7 +1061,7 @@ public class IotMqttBrokerService implements Resettable {
         }
     }
 
-    private record Subscription(String topicFilter, int qos) {
+    record Subscription(String topicFilter, int qos) {
     }
 
     record ConnectionInfo(String clientId, String address, int port) {

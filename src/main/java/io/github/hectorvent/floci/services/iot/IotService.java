@@ -1220,7 +1220,7 @@ public class IotService {
         byte[] message = payload == null ? new byte[0] : payload;
         publish(topic, message, retain, qos, region, null);
         if (!topic.startsWith("$aws/")) {
-            mqttBrokerService.publish(topic, message);
+            mqttBrokerService.publish(topic, message, qos);
         }
     }
 
@@ -1238,7 +1238,7 @@ public class IotService {
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "MQTT client is not connected: " + clientId, 404));
     }
 
-    public Page<String> listSubscriptions(String clientId, Integer maxResults, String nextToken) {
+    public Page<IotMqttBrokerService.Subscription> listSubscriptions(String clientId, Integer maxResults, String nextToken) {
         getConnection(clientId);
         return paginate(mqttBrokerService.listSubscriptions(clientId), maxResults, nextToken);
     }

@@ -876,7 +876,8 @@ class IotMqttBrokerServiceTest {
             deleting.shutdown();
             reconnecting.shutdown();
         }
-        assertEquals(List.of("devices/reconnecting/commands"), racing.listSubscriptions("reconnecting"));
+        assertEquals(List.of(new IotMqttBrokerService.Subscription("devices/reconnecting/commands", 0)),
+                racing.listSubscriptions("reconnecting"));
     }
 
     @Test

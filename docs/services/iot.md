@@ -34,7 +34,7 @@ Supported MVP 2 behavior:
 - Jobs control plane: `CreateJob`, `DescribeJob`, and `ListJobs`, including thing ARN targets and static thing group targets.
 - Jobs data plane: pending-job listing, `StartNextPendingJobExecution`, `DescribeJobExecution`, and `UpdateJobExecution` with version conflicts and terminal-state checks.
 - Endpoint discovery accepts `iot:Jobs` and `iot:CredentialProvider` in addition to IoT Data endpoint types.
-- MQTT clients can use QoS 1 subscribe/publish paths with broker PUBACK and delivery behavior.
+- MQTT clients can publish and subscribe at QoS 0 and QoS 1. The broker acknowledges a QoS 1 publish with `PUBACK` and delivers each message at the lower of its publish QoS and the highest QoS granted to the subscriber's matching subscriptions, as MQTT specifies; a retained message goes out at the lower of its stored QoS and the subscription's. `ListSubscriptions` reports the QoS granted to each subscription. Messages Floci publishes itself (shadow responses, lifecycle events, `republish` and `SendDirectMessage`) are delivered at QoS 0.
 - IoT Data `Publish` over HTTP reaches the matching MQTT subscribers on every listener, as on AWS, besides storing the retained message and running the topic rules. A publish to a reserved `$aws/` topic is not delivered to subscribers.
 - IoT Data connection APIs for live MQTT sessions: `GetConnection`, `DeleteConnection`, `ListSubscriptions`, and `SendDirectMessage`.
 - `DeleteConnection` closes active MQTT client sessions through the embedded broker, optionally purges broker session state for `cleanSession=true`, and publishes the client's [Last Will](#last-will) unless `preventWillMessage=true`.

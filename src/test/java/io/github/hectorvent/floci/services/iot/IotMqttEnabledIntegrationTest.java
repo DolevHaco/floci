@@ -358,6 +358,80 @@ class IotMqttEnabledIntegrationTest {
     }
 
     @Test
+    void deliveryQosIsTheLowerOfThePublishQosAndTheSubscriptionQos() throws Exception {
+        String topic = "phase/qos/" + System.nanoTime();
+        byte[] payload = "qos".getBytes(StandardCharsets.UTF_8);
+
+        try (MqttTestClient atLeastOnce = connectMqtt("qos-sub-1"); MqttTestClient atMostOnce = connectMqtt("qos-sub-0")) {
+            atLeastOnce.subscribe(topic, 1);
+            atMostOnce.subscribe(topic, 0);
+            try (MqttTestClient publisher = connectMqtt("qos-pub")) {
+                publisher.publish(topic, payload, 1);
+                publisher.publish(topic, payload, 0);
+            }
+            given()
+                .contentType("application/octet-stream")
+                .queryParam("qos", 1)
+                .body(payload)
+            .when()
+                .post("/topics/" + topic)
+            .then()
+                .statusCode(200);
+
+            assertEquals(List.of(1, 0, 1), List.of(atLeastOnce.takePublish().qos(), atLeastOnce.takePublish().qos(),
+                    atLeastOnce.takePublish().qos()));
+            assertEquals(List.of(0, 0, 0), List.of(atMostOnce.takePublish().qos(), atMostOnce.takePublish().qos(),
+                    atMostOnce.takePublish().qos()));
+        }
+    }
+
+    @Test
+    void aRetainedMessageIsDeliveredAtTheLowerOfItsQosAndTheSubscriptionQos() throws Exception {
+        String topic = "phase/qos-retained/" + System.nanoTime();
+        given()
+            .contentType("application/octet-stream")
+            .queryParam("retain", true)
+            .queryParam("qos", 1)
+            .body("kept".getBytes(StandardCharsets.UTF_8))
+        .when()
+            .post("/topics/" + topic)
+        .then()
+            .statusCode(200);
+        cleanup.register(() -> given().contentType("application/octet-stream").queryParam("retain", true).body(new byte[0])
+                .when().post("/topics/" + topic).then().statusCode(200));
+
+        try (MqttTestClient atLeastOnce = connectMqtt("qos-retained-sub-1")) {
+            atLeastOnce.subscribe(topic, 1);
+            assertEquals(1, atLeastOnce.takePublish().qos());
+        }
+        try (MqttTestClient atMostOnce = connectMqtt("qos-retained-sub-0")) {
+            atMostOnce.subscribe(topic, 0);
+            assertEquals(0, atMostOnce.takePublish().qos());
+        }
+    }
+
+    @Test
+    void listSubscriptionsReportsTheGrantedQosOfEachSubscription() throws Exception {
+        String clientId = uniqueClientId("qos-list");
+        String prefix = "phase/qos-list/" + System.nanoTime();
+
+        try (MqttTestClient client = connectMqttClientId(clientId)) {
+            client.subscribe(prefix + "/a", 1);
+            client.subscribe(prefix + "/b", 0);
+
+            given()
+            .when()
+                .get("/connections/{clientId}/subscriptions", clientId)
+            .then()
+                .statusCode(200)
+                .body("subscriptions[0].topicFilter", equalTo(prefix + "/a"))
+                .body("subscriptions[0].qos", equalTo(1))
+                .body("subscriptions[1].topicFilter", equalTo(prefix + "/b"))
+                .body("subscriptions[1].qos", equalTo(0));
+        }
+    }
+
+    @Test
     void httpPublishIsDeliveredOnceToMqttSubscribers() throws Exception {
         String topic = "phase/http/" + System.nanoTime();
         byte[] payload = "over-http".getBytes(StandardCharsets.UTF_8);

@@ -112,13 +112,13 @@ public class IotDataController {
     public Response listSubscriptions(@PathParam("clientId") String clientId,
                                       @QueryParam("maxResults") Integer maxResults,
                                       @QueryParam("nextToken") String nextToken) {
-        IotService.Page<String> page = iotService.listSubscriptions(clientId, maxResults, nextToken);
+        IotService.Page<IotMqttBrokerService.Subscription> page = iotService.listSubscriptions(clientId, maxResults, nextToken);
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode subscriptions = response.putArray("subscriptions");
-        for (String topicFilter : page.items()) {
+        for (IotMqttBrokerService.Subscription item : page.items()) {
             ObjectNode subscription = subscriptions.addObject();
-            subscription.put("topicFilter", topicFilter);
-            subscription.put("qos", 0);
+            subscription.put("topicFilter", item.topicFilter());
+            subscription.put("qos", item.qos());
         }
         if (page.nextToken() != null) {
             response.put("nextToken", page.nextToken());

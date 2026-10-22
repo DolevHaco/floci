@@ -226,12 +226,13 @@ class IotServiceTest {
         createRule("metricsRule", sqsThenLambdaRule(null));
         byte[] payload = "{\"v\":1}".getBytes(StandardCharsets.UTF_8);
 
-        service.publishOverHttp(TOPIC, payload, false, 0, null);
+        service.publishOverHttp(TOPIC, payload, false, 1, null);
         service.publishOverHttp("$aws/things/sensor-1/shadow/update", payload, false, 0, null);
         service.publish(TOPIC, payload, false, 0, null, "sensor-1");
 
-        verify(broker, times(1)).publish(TOPIC, payload);
-        verify(broker, times(1)).publish(anyString(), any());
+        verify(broker, times(1)).publish(TOPIC, payload, 1);
+        verify(broker, times(1)).publish(anyString(), any(), anyInt());
+        verify(broker, never()).publish(anyString(), any());
         verify(sqs, times(2)).sendMessage(eq(QUEUE_URL), eq("{\"v\":1}"), eq(0), eq(REGION));
         assertEquals(List.of(TOPIC, "$aws/things/sensor-1/shadow/update", TOPIC), recordedTopics());
     }
