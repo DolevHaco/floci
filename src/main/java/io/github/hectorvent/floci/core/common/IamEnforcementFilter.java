@@ -1637,13 +1637,17 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
     /**
      * Logs, Secrets Manager and KMS targets depend on the serving operation and the request's partition, STS
-     * and SSM targets on the serving operation;
+     * and SSM targets on the serving operation, and Kinesis and DynamoDB Streams GetRecords on the stream
+     * their iterator reads.
      * Scheduler, Pipes and DSQL targets on the request's partition, which those services mint their ARNs in; and the
      * targets of a namespace the table of request resources reads on {@code operation}, the one the request is
      * dispatched as (see {@link RequestResources}).
      */
     private List<String> targetResources(String credentialScope, String action, String operation,
                                          ContainerRequestContext ctx, String region, String accountId) {
+        if ("kinesis:GetRecords".equals(action) || "dynamodb:GetRecords".equals(action)) {
+            return arnBuilder.buildGetRecordsResources(action, ctx, region, accountId);
+        }
         if ("logs".equals(credentialScope)) {
             return arnBuilder.buildLogResources(action, ctx, region, accountId, requestPartition());
         }

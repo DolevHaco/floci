@@ -92,6 +92,8 @@ delivery succeeds; its unflushed buffer remains in memory. Pipes keeps its exist
 advance-before-delivery policy and first-shard polling limitation; child scheduling
 and full lineage orchestration are not implemented.
 
+`GetRecords` reads the stream its shard iterator was minted for. A `StreamARN` sent beside the iterator has to name that stream: one naming another stream is refused with `InvalidArgumentException`, as `ListShards` refuses a `StreamARN` its `NextToken` does not belong to. With IAM enforcement on, `GetRecords` is authorized against the stream its iterator reads, so `kinesis:Get*` on a stream's ARN, the policy in the developer guide's [Controlling access](https://docs.aws.amazon.com/streams/latest/dev/controlling-access.html) Example 1, reads that stream's records.
+
 ## Record Retention
 
 A stream's retention period (default 24 hours, `IncreaseStreamRetentionPeriod`/`DecreaseStreamRetentionPeriod` up to 8760 hours) is enforced: a record older than the current retention period is not returned by `GetRecords` or the `GET /_aws/kinesis/records` inspection endpoint, and is actually removed from memory rather than merely hidden. Expiry is checked lazily on each stream's next `PutRecord`/`PutRecords` or read after a record ages out; there is no scheduled sweep. After `DecreaseStreamRetentionPeriod`, records outside the new window are inaccessible from the next put or read, in line with AWS making them inaccessible almost immediately. Shard iterators (including `NextShardIterator` continuation tokens and `LATEST`) resolve by sequence number, so they keep working correctly across pruning even if the exact record they were positioned at has since expired.

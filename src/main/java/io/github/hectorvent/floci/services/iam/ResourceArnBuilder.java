@@ -12,8 +12,10 @@ import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.SigV4CredentialScope;
 import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbStreamService;
 import io.github.hectorvent.floci.services.eks.EksController;
 import io.github.hectorvent.floci.services.eks.EksService;
+import io.github.hectorvent.floci.services.kinesis.KinesisService;
 import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.durable.DurableTokens;
@@ -89,6 +91,10 @@ public class ResourceArnBuilder {
      * its service follows with a minted id is stored under.
      */
     private final Instance<StoredResourceArns> storedResourceArns;
+    /** Looked up lazily for the same reason, to read the stream a Kinesis shard iterator reads. */
+    private final Instance<KinesisService> kinesisService;
+    /** Looked up lazily for the same reason, to read the stream a DynamoDB Streams shard iterator reads. */
+    private final Instance<DynamoDbStreamService> dynamoDbStreamService;
 
     @Inject
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -96,7 +102,9 @@ public class ResourceArnBuilder {
                               Instance<LambdaMicrovmsService> microvmsService,
                               Instance<EksService> eksService,
                               Instance<KmsService> kmsService,
-                              Instance<StoredResourceArns> storedResourceArns) {
+                              Instance<StoredResourceArns> storedResourceArns,
+                              Instance<KinesisService> kinesisService,
+                              Instance<DynamoDbStreamService> dynamoDbStreamService) {
         this.objectMapper = objectMapper;
         this.iamService = iamService;
         this.secretsManagerService = secretsManagerService;
@@ -104,6 +112,18 @@ public class ResourceArnBuilder {
         this.eksService = eksService;
         this.kmsService = kmsService;
         this.storedResourceArns = storedResourceArns;
+        this.kinesisService = kinesisService;
+        this.dynamoDbStreamService = dynamoDbStreamService;
+    }
+
+    public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
+                              Instance<SecretsManagerService> secretsManagerService,
+                              Instance<LambdaMicrovmsService> microvmsService,
+                              Instance<EksService> eksService,
+                              Instance<KmsService> kmsService,
+                              Instance<StoredResourceArns> storedResourceArns) {
+        this(objectMapper, iamService, secretsManagerService, microvmsService, eksService, kmsService,
+                storedResourceArns, null, null);
     }
 
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -1646,6 +1666,57 @@ public class ResourceArnBuilder {
             }
         }
         return AwsArnUtils.Arn.of("kinesis", region, accountId, "stream/*").toString();
+    }
+
+    /**
+     * Kinesis and DynamoDB Streams GetRecords read nothing but their shard iterator, so they are
+     * authorized against the stream that iterator was minted for, whatever else the body names. An
+     * iterator the stream service cannot read, which Kinesis refuses before reading anything and which
+     * another DynamoDB engine may have minted, leaves a Kinesis call on the {@code StreamARN} it names
+     * and a DynamoDB Streams call on the wildcard.
+     */
+    public List<String> buildGetRecordsResources(String action, ContainerRequestContext ctx, String region,
+                                                 String accountId) {
+        JsonNode json = readJsonBody(ctx);
+        String iterator = json != null && json.hasNonNull("ShardIterator") ? json.get("ShardIterator").asText() : "";
+        if ("kinesis:GetRecords".equals(action)) {
+            String streamName = kinesisIteratorStream(iterator);
+            if (streamName != null) {
+                return List.of(AwsArnUtils.Arn.of("kinesis", region, accountId, "stream/" + streamName).toString());
+            }
+            String streamArn = json != null && json.hasNonNull("StreamARN") ? json.get("StreamARN").asText().trim() : "";
+            return List.of(streamArn.isEmpty()
+                    ? AwsArnUtils.Arn.of("kinesis", region, accountId, "stream/*").toString()
+                    : streamArn);
+        }
+        String streamArn = dynamoDbIteratorStream(iterator);
+        return List.of(streamArn != null ? streamArn : "*");
+    }
+
+    private String kinesisIteratorStream(String iterator) {
+        if (kinesisService == null || iterator.isEmpty()) {
+            return null;
+        }
+        try {
+            String streamName = kinesisService.get().streamNameOf(iterator);
+            return streamName.isEmpty() ? null : streamName;
+        } catch (AwsException e) {
+            // A malformed iterator, which GetRecords refuses before reading any stream.
+            return null;
+        }
+    }
+
+    private String dynamoDbIteratorStream(String iterator) {
+        if (dynamoDbStreamService == null || iterator.isEmpty()) {
+            return null;
+        }
+        try {
+            String streamArn = dynamoDbStreamService.get().streamArnOf(iterator);
+            return AwsArnUtils.isArnFor(streamArn, "dynamodb") ? streamArn : null;
+        } catch (AwsException e) {
+            // Malformed, or minted by the DynamoDB Local engine, whose iterators only it reads.
+            return null;
+        }
     }
 
     // ── Secrets Manager ──────────────────────────────────────────────────────────
