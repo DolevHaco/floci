@@ -1607,50 +1607,42 @@ public class DynamoDbService {
         // order. Using only the first sort-key attribute would ignore the remaining components
         // (e.g. a "requestStateQuery RANGE, createdAt RANGE" index would never order by createdAt),
         // which in turn breaks ScanIndexForward=false. See floci-io/floci#1675.
+        // Items tied on the sort key stay in base item key order, the order they were read in.
+        String tablePkName = table.getPartitionKeyName();
+        String tableSkName = table.getSortKeyName();
+        List<String> finalSortKeyNames = sortKeyNames;
+        Comparator<JsonNode> keyOrder = ((Comparator<JsonNode>) (a, b) -> {
+            for (String name : finalSortKeyNames) {
+                JsonNode aAttr = a.get(name);
+                JsonNode bAttr = b.get(name);
+                int cmp;
+                if (aAttr == null && bAttr == null) cmp = 0;
+                else if (aAttr == null) cmp = -1;
+                else if (bAttr == null) cmp = 1;
+                else cmp = ExpressionEvaluator.compareAttributeValues(aAttr, bAttr);
+                if (cmp != 0) return cmp;
+            }
+            return 0;
+        }).thenComparing(item -> buildItemKeyFromNode(item, tablePkName, tableSkName));
+        boolean descending = !sortKeyNames.isEmpty() && Boolean.FALSE.equals(scanIndexForward);
         if (!sortKeyNames.isEmpty()) {
-            List<String> finalSortKeyNames = sortKeyNames;
             results = new ArrayList<>(results);
-            results.sort((a, b) -> {
-                for (String name : finalSortKeyNames) {
-                    JsonNode aAttr = a.get(name);
-                    JsonNode bAttr = b.get(name);
-                    int cmp;
-                    if (aAttr == null && bAttr == null) cmp = 0;
-                    else if (aAttr == null) cmp = -1;
-                    else if (bAttr == null) cmp = 1;
-                    else cmp = ExpressionEvaluator.compareAttributeValues(aAttr, bAttr);
-                    if (cmp != 0) return cmp;
-                }
-                return 0;
-            });
-            if (Boolean.FALSE.equals(scanIndexForward)) {
+            results.sort(keyOrder);
+            if (descending) {
                 Collections.reverse(results);
             }
         }
 
-        // Apply ExclusiveStartKey offset
+        // ExclusiveStartKey is a position in key order: the item it names may have been
+        // deleted since the page that returned it, so the read resumes after where it sorts.
         if (exclusiveStartKey != null) {
-            String tablePkName = table.getPartitionKeyName();
-            String tableSkName = table.getSortKeyName();
-            boolean hasTableKeys = exclusiveStartKey.has(tablePkName);
-
-            String startItemKey = hasTableKeys
-                    ? buildItemKeyFromNode(exclusiveStartKey, tablePkName, tableSkName)
-                    : buildItemKeyFromNode(exclusiveStartKey, pkName, sortKeyNames);
-
-            int startIdx = -1;
-            for (int i = 0; i < results.size(); i++) {
-                String thisKey = hasTableKeys
-                        ? buildItemKeyFromNode(results.get(i), tablePkName, tableSkName)
-                        : buildItemKeyFromNode(results.get(i), pkName, sortKeyNames);
-                if (thisKey.equals(startItemKey)) {
-                    startIdx = i;
-                    break;
-                }
+            int direction = descending ? -1 : 1;
+            int startIdx = 0;
+            while (startIdx < results.size()
+                    && direction * keyOrder.compare(results.get(startIdx), exclusiveStartKey) <= 0) {
+                startIdx++;
             }
-            if (startIdx >= 0) {
-                results = new ArrayList<>(results.subList(startIdx + 1, results.size()));
-            }
+            results = new ArrayList<>(results.subList(startIdx, results.size()));
         }
 
         List<JsonNode> evaluatedItems = results;
