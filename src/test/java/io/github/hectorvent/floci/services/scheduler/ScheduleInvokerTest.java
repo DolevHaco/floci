@@ -157,7 +157,7 @@ class ScheduleInvokerTest {
 
         ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
         verify(sqsService).sendMessage(eq("http://localhost:4566/000000000000/no-input"), body.capture(),
-                eq(0), isNull(), isNull(), eq("eu-central-1"));
+                isNull(), isNull(), isNull(), eq("eu-central-1"));
         assertDefaultScheduledEvent(body.getValue(), "eu-central-1", "2024-11-07T22:05:00Z");
     }
 
@@ -332,8 +332,22 @@ class ScheduleInvokerTest {
         invoke(target, "us-east-1");
 
         verify(sqsService).sendMessage(eq("http://localhost:4566/000000000000/q.fifo"),
-                eq("hi"), eq(0), eq("g1"), eq("dedup-1"),
+                eq("hi"), isNull(), eq("g1"), eq("dedup-1"),
                 argThat(attrs -> attrs == null || attrs.isEmpty()), eq("us-east-1"));
+    }
+
+    @Test
+    void universalSqsSendMessageForwardsDelaySecondsFromInput() {
+        Target target = new Target();
+        target.setArn("arn:aws:scheduler:::aws-sdk:sqs:sendMessage");
+        target.setRoleArn("arn:aws:iam::000000000000:role/x");
+        target.setInput("{\"QueueUrl\":\"http://localhost:4566/000000000000/q\","
+                + "\"MessageBody\":\"hi\",\"DelaySeconds\":5}");
+
+        invoke(target, "us-east-1");
+
+        verify(sqsService).sendMessage(eq("http://localhost:4566/000000000000/q"), eq("hi"), eq(5), isNull(),
+                isNull(), argThat(attrs -> attrs == null || attrs.isEmpty()), eq("us-east-1"));
     }
 
     @Test
@@ -356,7 +370,7 @@ class ScheduleInvokerTest {
         invoke(target, "us-east-1");
 
         ArgumentCaptor<Map<String, MessageAttributeValue>> attributesCaptor = ArgumentCaptor.captor();
-        verify(sqsService).sendMessage(eq(queueUrl), eq("hi"), eq(0), eq("g1"), eq("dedup-1"),
+        verify(sqsService).sendMessage(eq(queueUrl), eq("hi"), isNull(), eq("g1"), eq("dedup-1"),
                 attributesCaptor.capture(), eq("us-east-1"));
 
         Map<String, MessageAttributeValue> attributes = attributesCaptor.getValue();
@@ -500,7 +514,7 @@ class ScheduleInvokerTest {
         invoke(target, "us-east-1");
 
         ArgumentCaptor<Map<String, MessageAttributeValue>> attributesCaptor = ArgumentCaptor.captor();
-        verify(sqsService).sendMessage(eq(queueUrl), eq("hi"), eq(0), isNull(), isNull(),
+        verify(sqsService).sendMessage(eq(queueUrl), eq("hi"), isNull(), isNull(), isNull(),
                 attributesCaptor.capture(), eq("us-east-1"));
 
         // Same bytes real AWS delivers for this Input: the UTF-8 encoding of the decoded JSON string
@@ -526,7 +540,7 @@ class ScheduleInvokerTest {
         invoke(target, "us-east-1");
 
         ArgumentCaptor<Map<String, MessageAttributeValue>> attributesCaptor = ArgumentCaptor.captor();
-        verify(sqsService).sendMessage(eq(queueUrl), eq("hi"), eq(0), eq("g1"), eq("dedup-1"),
+        verify(sqsService).sendMessage(eq(queueUrl), eq("hi"), isNull(), eq("g1"), eq("dedup-1"),
                 attributesCaptor.capture(), eq("us-east-1"));
 
         Map<String, MessageAttributeValue> attributes = attributesCaptor.getValue();
@@ -543,7 +557,7 @@ class ScheduleInvokerTest {
 
         invoke(target, "us-east-1");
 
-        verify(sqsService).sendMessage(anyString(), eq("{\"hello\":\"world\"}"), eq(0),
+        verify(sqsService).sendMessage(anyString(), eq("{\"hello\":\"world\"}"), isNull(),
                 eq("group-7"), isNull(), eq("us-east-1"));
     }
 
@@ -775,7 +789,7 @@ class ScheduleInvokerTest {
 
         String expected = "{\"arn\":\"" + SCHEDULE_ARN + "\",\"time\":\"2026-04-21T09:17:54Z\","
                 + "\"id\":\"d32c5kddcf5bb8c3\",\"attempt\":3}";
-        verify(sqsService).sendMessage(anyString(), eq(expected), eq(0), isNull(), isNull(), eq("us-east-1"));
+        verify(sqsService).sendMessage(anyString(), eq(expected), isNull(), isNull(), isNull(), eq("us-east-1"));
         assertTrue(request.contains("2026-04-21T09:17:54Z"), request);
     }
 
@@ -806,7 +820,7 @@ class ScheduleInvokerTest {
         invoker.invoke(scheduleIn("us-east-1", target), SCHEDULED_AT, "0123456789abcdef", 2);
 
         verify(sqsService).sendMessage(eq("http://localhost:4566/000000000000/q"),
-                eq(SCHEDULE_ARN + "|2026-04-21T09:17:54Z|0123456789abcdef|2"), eq(0), isNull(), isNull(),
+                eq(SCHEDULE_ARN + "|2026-04-21T09:17:54Z|0123456789abcdef|2"), isNull(), isNull(), isNull(),
                 argThat(attrs -> attrs == null || attrs.isEmpty()), eq("us-east-1"));
     }
 
@@ -818,7 +832,7 @@ class ScheduleInvokerTest {
 
         invoker.invoke(scheduleIn("us-east-1", target), SCHEDULED_AT, "0123456789abcdef", 4);
 
-        verify(sqsService).sendMessage(anyString(), eq("{\"plain\":\"<b>not a keyword</b>\"}"), eq(0),
+        verify(sqsService).sendMessage(anyString(), eq("{\"plain\":\"<b>not a keyword</b>\"}"), isNull(),
                 isNull(), isNull(), eq("us-east-1"));
     }
 
@@ -831,7 +845,7 @@ class ScheduleInvokerTest {
         invoke(target, "us-east-1");
 
         ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
-        verify(sqsService).sendMessage(anyString(), body.capture(), eq(0), isNull(), isNull(), eq("us-east-1"));
+        verify(sqsService).sendMessage(anyString(), body.capture(), isNull(), isNull(), isNull(), eq("us-east-1"));
         assertTrue(body.getValue().matches("[0-9a-f]{16}/1"), body.getValue());
     }
 
