@@ -62,6 +62,7 @@ class IotMqttEnabledIntegrationTest {
 
     static final int AWS_MAX_PAYLOAD = 128 * 1024;
     private static final String BROKER_URI = "tcp://127.0.0.1:" + IotMqttTlsProfile.PLAIN_PORT;
+    private static final byte[] WILL_PAYLOAD = "gone".getBytes(StandardCharsets.UTF_8);
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final String BUILDING_RULE_SQL = "SELECT *, topic() AS topic, clientid() AS cid "
             + "FROM '$aws/things/+/shadow/name/building/update/accepted' WHERE endswith(clientToken, 'inbound')";
@@ -116,6 +117,69 @@ class IotMqttEnabledIntegrationTest {
         .then()
             .statusCode(404)
             .body("__type", equalTo("ResourceNotFoundException"));
+    }
+
+    @Test
+    void lastWillIsPublishedWhenTheClientDropsWithoutDisconnect() throws Exception {
+        String willTopic = "lwt/" + System.nanoTime();
+
+        try (MqttTestClient subscriber = connectMqtt("lwt-lost-sub")) {
+            subscriber.subscribe(willTopic, 1);
+            MqttTestClient publisher = connectWithWill(uniqueClientId("lwt-lost-pub"), willTopic);
+            publisher.closeWithoutDisconnect();
+
+            MqttPublish will = subscriber.takePublish();
+            assertEquals(willTopic, will.topic());
+            assertArrayEquals(WILL_PAYLOAD, will.payload());
+            subscriber.assertNoPublish();
+        }
+    }
+
+    @Test
+    void lastWillIsNotPublishedAfterAClientDisconnect() throws Exception {
+        String willTopic = "lwt/" + System.nanoTime();
+
+        try (MqttTestClient subscriber = connectMqtt("lwt-clean-sub")) {
+            subscriber.subscribe(willTopic, 1);
+            connectWithWill(uniqueClientId("lwt-clean-pub"), willTopic).close();
+
+            subscriber.assertNoPublish();
+        }
+    }
+
+    @Test
+    void deleteConnectionPublishesTheLastWillUnlessPreventWillMessageIsSet() throws Exception {
+        String willTopic = "lwt/" + System.nanoTime();
+
+        try (MqttTestClient subscriber = connectMqtt("lwt-api-sub")) {
+            subscriber.subscribe(willTopic, 1);
+
+            String prevented = uniqueClientId("lwt-api-prevented");
+            try (MqttTestClient client = connectWithWill(prevented, willTopic)) {
+                given()
+                    .queryParam("preventWillMessage", true)
+                .when()
+                    .delete("/connections/{clientId}", prevented)
+                .then()
+                    .statusCode(200);
+                client.awaitDisconnected();
+            }
+            subscriber.assertNoPublish();
+
+            String allowed = uniqueClientId("lwt-api-allowed");
+            try (MqttTestClient client = connectWithWill(allowed, willTopic)) {
+                given()
+                    .queryParam("preventWillMessage", false)
+                .when()
+                    .delete("/connections/{clientId}", allowed)
+                .then()
+                    .statusCode(200);
+                client.awaitDisconnected();
+            }
+            MqttPublish will = subscriber.takePublish();
+            assertEquals(willTopic, will.topic());
+            assertArrayEquals(WILL_PAYLOAD, will.payload());
+        }
     }
 
     @Test
@@ -916,6 +980,13 @@ class IotMqttEnabledIntegrationTest {
         return MqttTestClient.connect(clientId);
     }
 
+    /** A QoS 1, non-retained Last Will of {@link #WILL_PAYLOAD} on {@code willTopic}. */
+    private MqttTestClient connectWithWill(String clientId, String willTopic) throws MqttException {
+        MqttConnectOptions options = MqttTestClient.connectOptions();
+        options.setWill(willTopic, WILL_PAYLOAD, 1, false);
+        return MqttTestClient.connect(clientId, options);
+    }
+
     private String uniqueClientId(String clientId) {
         return clientId + "-" + System.nanoTime();
     }
@@ -995,6 +1066,10 @@ class IotMqttEnabledIntegrationTest {
         }
 
         static MqttTestClient connect(String clientId) throws MqttException {
+            return connect(clientId, connectOptions());
+        }
+
+        static MqttTestClient connect(String clientId, MqttConnectOptions options) throws MqttException {
             MqttClient client = new MqttClient(BROKER_URI, clientId, new MemoryPersistence());
             client.setTimeToWait(10_000);
             MqttTestClient testClient = new MqttTestClient(client);
@@ -1012,7 +1087,7 @@ class IotMqttEnabledIntegrationTest {
                 public void deliveryComplete(IMqttDeliveryToken token) {
                 }
             });
-            client.connect(connectOptions());
+            client.connect(options);
             return testClient;
         }
 

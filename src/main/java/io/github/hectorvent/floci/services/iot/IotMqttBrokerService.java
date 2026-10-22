@@ -27,6 +27,7 @@ import io.vertx.mqtt.MqttEndpoint;
 import io.vertx.mqtt.MqttServer;
 import io.vertx.mqtt.MqttServerOptions;
 import io.vertx.mqtt.MqttTopicSubscription;
+import io.vertx.mqtt.MqttWill;
 import io.vertx.mqtt.messages.MqttPublishMessage;
 import io.vertx.mqtt.messages.MqttSubscribeMessage;
 import io.vertx.mqtt.messages.MqttUnsubscribeMessage;
@@ -383,10 +384,15 @@ public class IotMqttBrokerService implements Resettable {
     }
 
     boolean disconnectClient(String clientId, boolean cleanSession) {
+        return disconnectClient(clientId, cleanSession, false);
+    }
+
+    /** IoT Data {@code DeleteConnection}: the session's Last Will is published unless {@code preventWillMessage}. */
+    boolean disconnectClient(String clientId, boolean cleanSession, boolean preventWillMessage) {
         ClientSession session;
         synchronized (sessionLock) {
             session = sessionsByClient.get(clientId);
-            if (session == null || !endSession(session, API_INITIATED_DISCONNECT)) {
+            if (session == null || !endSession(session, API_INITIATED_DISCONNECT, !preventWillMessage)) {
                 return false;
             }
             if (cleanSession) {
@@ -550,7 +556,8 @@ public class IotMqttBrokerService implements Resettable {
                     device == null ? config.defaultRegion() : device.region(),
                     System.currentTimeMillis(),
                     endpoint.keepAliveTimeSeconds(),
-                    new AtomicInteger());
+                    new AtomicInteger(),
+                    Will.of(endpoint.will()));
             ClientSession previous = sessionsByClient.put(clientId, session);
             if (previous != null && previous.endpoint() != endpoint) {
                 endSession(previous, DUPLICATE_CLIENTID);
@@ -727,15 +734,23 @@ public class IotMqttBrokerService implements Resettable {
             session.endpoint().publishAcknowledge(message.messageId());
         }
 
-        String topic = message.topicName();
+        routePublish(session, message.topicName(), payload, message.isRetain(), message.qosLevel().value(), ruleState.get());
+    }
+
+    /**
+     * Routes a message the session published, or its Last Will: a reserved {@code $aws/} topic to
+     * the shadow service, anything else retained when asked, recorded, handed to the rule worker
+     * under the rule state {@code admitted} and fanned out to subscribers.
+     */
+    private void routePublish(ClientSession session, String topic, byte[] payload, boolean retain, int qos, long admitted) {
         if (topic.startsWith("$aws/")) {
-            iotService.get().handleReservedMqttPublish(topic, payload, rules -> evaluateRulesOnWorker(topic, rules));
+            iotService.get().handleReservedMqttPublish(topic, payload, rules -> evaluateRulesOnWorker(topic, rules, admitted));
             return;
         }
 
-        iotService.get().publish(topic, payload, message.isRetain(), message.qosLevel().value(), null,
-                session.clientId(), rules -> evaluateRulesOnWorker(topic, rules));
-        fanOut(topic, payload, message.qosLevel().value());
+        iotService.get().publish(topic, payload, retain, qos, null, session.clientId(),
+                rules -> evaluateRulesOnWorker(topic, rules, admitted));
+        fanOut(topic, payload, qos);
     }
 
     /**
@@ -843,13 +858,18 @@ public class IotMqttBrokerService implements Resettable {
         }
     }
 
+    /** Ends the session; its Last Will is published for every reason but the client's own DISCONNECT. */
+    private boolean endSession(ClientSession session, String reason) {
+        return endSession(session, reason, !CLIENT_INITIATED_DISCONNECT.equals(reason));
+    }
+
     /**
      * Ends the session once: the first reason reported wins, and only that one publishes the
-     * disconnected event, records how the session ended for fleet indexing, and gets true. The
-     * versionNumber counts up only while the session is still the client id's current one, so a
-     * session replaced by a newer connection leaves it alone.
+     * disconnected event, then the Last Will when {@code publishWill}, records how the session
+     * ended for fleet indexing, and gets true. The versionNumber counts up only while the session
+     * is still the client id's current one, so a session replaced by a newer connection leaves it alone.
      */
-    private boolean endSession(ClientSession session, String reason) {
+    private boolean endSession(ClientSession session, String reason, boolean publishWill) {
         synchronized (sessionLock) {
             if (!session.ended().compareAndSet(false, true)) {
                 return false;
@@ -862,8 +882,21 @@ public class IotMqttBrokerService implements Resettable {
                 subscriptionsByClient.remove(session.clientId());
             }
             publishPresence(session, "disconnected", reason);
+            if (publishWill && session.will() != null) {
+                publishWill(session);
+            }
             return true;
         }
+    }
+
+    /**
+     * Publishes the session's Last Will as the session would have published it, scheduled like a
+     * lifecycle event because the caller holds the session lock and possibly an endpoint's monitor.
+     */
+    private void publishWill(ClientSession session) {
+        Will will = session.will();
+        long admitted = ruleState.get();
+        vertx.runOnContext(ignored -> routePublish(session, will.topic(), will.payload(), will.retain(), will.qos(), admitted));
     }
 
     /**
@@ -974,7 +1007,8 @@ public class IotMqttBrokerService implements Resettable {
             String region,
             long connectedAt,
             int keepAliveDuration,
-            AtomicInteger packetIds) {
+            AtomicInteger packetIds,
+            Will will) {
 
         /**
          * The packet identifier of a copy sent at {@code qos}: none at QoS 0, otherwise the session's
@@ -1000,6 +1034,22 @@ public class IotMqttBrokerService implements Resettable {
     }
 
     private record HistoryKey(String accountId, String region, String clientId) {
+    }
+
+    /** The Last Will a CONNECT carried; null when it carried none or its topic is not a valid topic name. */
+    private record Will(String topic, byte[] payload, int qos, boolean retain) {
+
+        static Will of(MqttWill will) {
+            if (will == null || !will.isWillFlag()) {
+                return null;
+            }
+            String topic = will.getWillTopic();
+            if (topic == null || topic.isEmpty() || topic.contains("#") || topic.contains("+")) {
+                return null;
+            }
+            byte[] payload = will.getWillMessageBytes();
+            return new Will(topic, payload == null ? new byte[0] : payload, will.getWillQos(), will.isWillRetain());
+        }
     }
 
     private record Subscription(String topicFilter, int qos) {

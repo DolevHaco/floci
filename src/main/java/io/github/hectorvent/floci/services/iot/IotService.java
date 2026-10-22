@@ -1223,9 +1223,9 @@ public class IotService {
         }
     }
 
-    public void deleteConnection(String clientId, boolean cleanSession) {
+    public void deleteConnection(String clientId, boolean cleanSession, boolean preventWillMessage) {
         validateMqttClientId(clientId);
-        boolean disconnected = mqttBrokerService.disconnectClient(clientId, cleanSession);
+        boolean disconnected = mqttBrokerService.disconnectClient(clientId, cleanSession, preventWillMessage);
         if (!disconnected) {
             throw new AwsException("ResourceNotFoundException", "MQTT client is not connected: " + clientId, 404);
         }

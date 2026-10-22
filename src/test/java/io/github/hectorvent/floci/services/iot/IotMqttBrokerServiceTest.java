@@ -1082,6 +1082,43 @@ class IotMqttBrokerServiceTest {
         }
     }
 
+    @Test
+    void aBrokerStopPublishesNoLastWill() throws Exception {
+        startBrokerRecordingPublishes();
+        MqttClient client = connectPlainWithWill("stopped-will", "wills/stopped");
+        try {
+            awaitPresence("connected", "stopped-will", 1);
+
+            broker.stop();
+            awaitDisconnected(client);
+            awaitClosed(plainPort);
+            awaitClosed(tlsPort);
+            broker.startIfEnabled();
+            barrier();
+
+            assertEquals(List.of(), recordedOn("wills/stopped"));
+        } finally {
+            disconnect(client);
+        }
+    }
+
+    @Test
+    void aTakeoverPublishesTheLastWillOfTheReplacedSession() throws Exception {
+        startBrokerRecordingPublishes();
+        MqttClient replaced = connectPlainWithWill("taken-over", "wills/taken-over");
+        MqttClient current = connectPlain("taken-over");
+        try {
+            awaitPresence("disconnected", "taken-over", 1);
+            barrier();
+
+            assertEquals(List.of("gone"), recordedOn("wills/taken-over"));
+            assertEquals("DUPLICATE_CLIENTID", presence("disconnected", "taken-over").get(0).get("disconnectReason").asText());
+        } finally {
+            replaced.close(true);
+            disconnect(current);
+        }
+    }
+
     /**
      * Vert.x runs an endpoint's disconnect callback holding that endpoint's monitor, and a
      * subscriber's isConnected and publish take the subscriber's own. With the subscriber's monitor
@@ -2042,13 +2079,36 @@ class IotMqttBrokerServiceTest {
     }
 
     private MqttClient connectPlain(String clientId) throws MqttException {
+        return connectPlain(clientId, plainOptions());
+    }
+
+    /** A plaintext client whose Last Will is {@code gone} on {@code willTopic}. */
+    private MqttClient connectPlainWithWill(String clientId, String willTopic) throws MqttException {
+        MqttConnectOptions options = plainOptions();
+        options.setWill(willTopic, "gone".getBytes(StandardCharsets.UTF_8), 0, false);
+        return connectPlain(clientId, options);
+    }
+
+    private MqttClient connectPlain(String clientId, MqttConnectOptions options) throws MqttException {
         MqttClient client = new MqttClient("tcp://127.0.0.1:" + plainPort, clientId, new MemoryPersistence());
-        MqttConnectOptions options = new MqttConnectOptions();
-        options.setConnectionTimeout(10);
-        options.setAutomaticReconnect(false);
         client.connect(options);
         client.setTimeToWait(10_000);
         return client;
+    }
+
+    private static MqttConnectOptions plainOptions() {
+        MqttConnectOptions options = new MqttConnectOptions();
+        options.setConnectionTimeout(10);
+        options.setAutomaticReconnect(false);
+        return options;
+    }
+
+    /** The payloads recorded on one topic, as UTF-8, in publish order. */
+    private List<String> recordedOn(String topic) {
+        return recorder.recentEvents().stream()
+                .filter(event -> event.topic().equals(topic))
+                .map(event -> new String(event.payload(), StandardCharsets.UTF_8))
+                .toList();
     }
 
     private static void disconnect(MqttClient client) throws MqttException {

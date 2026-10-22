@@ -103,7 +103,7 @@ public class IotDataController {
     public Response deleteConnection(@PathParam("clientId") String clientId,
                                      @QueryParam("cleanSession") Boolean cleanSession,
                                      @QueryParam("preventWillMessage") Boolean preventWillMessage) {
-        iotService.deleteConnection(clientId, Boolean.TRUE.equals(cleanSession));
+        iotService.deleteConnection(clientId, Boolean.TRUE.equals(cleanSession), Boolean.TRUE.equals(preventWillMessage));
         return Response.ok().build();
     }
 
