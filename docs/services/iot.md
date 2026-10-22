@@ -356,7 +356,7 @@ Implementation notes:
 Current accepted limitation:
 
 - Certificate and `iot:Connect` checks are enforced on 8883 only; topic-level authorization is not enforced on either port yet.
-- Persistent offline sessions are not modeled yet.
+- Persistent sessions are modeled only as far as their subscriptions go: a client that reconnects with `cleanSession=false` keeps the subscriptions of its earlier session, and a clean connect discards them, as on AWS. Messages are not queued for an offline persistent session, and `CONNACK` always reports `sessionPresent=false`.
 - QoS 2 and advanced MQTT 5 property semantics remain follow-up scope.
 - At most 1,000 MQTT publishes are pending rule evaluation, running or waiting. While that many are pending, further publishes are still delivered to subscribers but their topic rules are skipped, with one warning logged until the backlog drains.
 - REST shadow errors are not published to `rejected`.

@@ -49,6 +49,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -117,6 +118,30 @@ class IotMqttEnabledIntegrationTest {
         .then()
             .statusCode(404)
             .body("__type", equalTo("ResourceNotFoundException"));
+    }
+
+    @Test
+    void aCleanSessionDoesNotInheritTheSubscriptionsOfAnEarlierPersistentSession() throws Exception {
+        String clientId = uniqueClientId("clean-after-persistent");
+        String topic = "phase/persistent/" + System.nanoTime();
+        MqttConnectOptions persistent = MqttTestClient.connectOptions();
+        persistent.setCleanSession(false);
+        try (MqttTestClient client = MqttTestClient.connect(clientId, persistent)) {
+            client.subscribe(topic);
+        }
+
+        try (MqttTestClient client = connectMqttClientId(clientId)) {
+            given()
+            .when()
+                .get("/connections/{clientId}/subscriptions", clientId)
+            .then()
+                .statusCode(200)
+                .body("subscriptions", empty());
+            try (MqttTestClient publisher = connectMqtt("clean-after-persistent-pub")) {
+                publisher.publish(topic, "stale".getBytes(StandardCharsets.UTF_8));
+            }
+            client.assertNoPublish();
+        }
     }
 
     @Test

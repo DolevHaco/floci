@@ -530,7 +530,8 @@ public class IotMqttBrokerService implements Resettable {
      * {@code clientIp} and {@code clientPort} are the address the client connected from: the
      * socket's, or for a WebSocket client the one the bridge recorded at the upgrade, as the
      * bridge's own socket is loopback. {@code connectNanos} is when the CONNECT arrived, which
-     * the keep-alive runs from.
+     * the keep-alive runs from. A clean session starts without the subscriptions an earlier
+     * persistent session of its client id left.
      */
     private void admit(MqttEndpoint endpoint, IotService.RegisteredDevice device, String clientIp, int clientPort,
                        long connectNanos) {
@@ -562,6 +563,9 @@ public class IotMqttBrokerService implements Resettable {
             if (previous != null && previous.endpoint() != endpoint) {
                 endSession(previous, DUPLICATE_CLIENTID);
                 replaced = previous;
+            }
+            if (cleanSession) {
+                subscriptionsByClient.remove(clientId);
             }
         }
         if (replaced != null) {
