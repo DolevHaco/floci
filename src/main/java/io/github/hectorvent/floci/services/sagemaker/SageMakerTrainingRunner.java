@@ -139,6 +139,11 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
                             .withTimeout(MAX_RUNTIME_STOP_GRACE_SECONDS).exec();
                 } catch (NotModifiedException alreadyStopped) {
                     LOG.debugv("SageMaker training container {0} exited before its runtime stop (304)", containerId);
+                } catch (RuntimeException stopFailed) {
+                    // A Docker API timeout below the grace window gives up on a container that ignores
+                    // SIGTERM; the job still ran out of time, and the forced removal below ends it.
+                    LOG.warnv("SageMaker training container {0} did not confirm its runtime stop: {1}",
+                            containerId, stopFailed.getMessage());
                 }
                 job.modelArtifactsS3ModelArtifacts = uploadModelArtifacts(containerId, job);
                 lifecycleManager.stopAndRemove(containerId, logs);

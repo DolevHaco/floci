@@ -28,6 +28,7 @@ import org.mockito.InOrder;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.util.HashSet;
 import java.util.List;
@@ -237,6 +238,28 @@ class SageMakerTrainingRunnerTest {
         assertEquals("MaxRuntimeExceeded", job.secondaryStatus);
         assertNull(job.failureReason);
         assertEquals("s3://bucket/output/slow/output/model.tar.gz", job.modelArtifactsS3ModelArtifacts);
+        runner.stopManagedContainers();
+    }
+
+    @Test
+    void aGracefulStopThatTimesOutStillStopsTheJobAndKeepsItsModelArtifacts() throws Exception {
+        // floci.docker.api-timeout-seconds below the 120 s grace: the client gives up on a container
+        // that ignores SIGTERM before Docker answers the stop.
+        StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
+        when(stop.exec()).thenThrow(new RuntimeException(new SocketTimeoutException("Read timed out")));
+        CopyArchiveFromContainerCmd copyModel = mock(CopyArchiveFromContainerCmd.class);
+        SageMakerTrainingRunner runner = dockerBackedRunner();
+
+        TrainingJobResource job = runPastMaxRuntime(runner, stop, copyModel);
+
+        assertEquals("Stopped", job.trainingJobStatus);
+        assertEquals("MaxRuntimeExceeded", job.secondaryStatus);
+        assertNull(job.failureReason);
+        assertEquals("s3://bucket/output/slow/output/model.tar.gz", job.modelArtifactsS3ModelArtifacts);
+        InOrder order = inOrder(stop, copyModel, lifecycle);
+        order.verify(stop).exec();
+        order.verify(copyModel).exec();
+        order.verify(lifecycle).stopAndRemove("container", null);
         runner.stopManagedContainers();
     }
 
