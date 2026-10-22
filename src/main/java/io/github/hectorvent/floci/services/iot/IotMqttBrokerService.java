@@ -969,8 +969,9 @@ public class IotMqttBrokerService implements Resettable {
         String[] topicLevels = topic.split("/", -1);
         for (int i = 0; i < filterLevels.length; i++) {
             String filterLevel = filterLevels[i];
+            // AWS IoT: sensor/# matches sensor/ and below, but not the parent topic sensor.
             if ("#".equals(filterLevel)) {
-                return i == filterLevels.length - 1;
+                return i == filterLevels.length - 1 && i < topicLevels.length;
             }
             if (i >= topicLevels.length) {
                 return false;

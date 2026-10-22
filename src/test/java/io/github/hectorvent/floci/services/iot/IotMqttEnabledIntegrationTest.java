@@ -356,6 +356,24 @@ class IotMqttEnabledIntegrationTest {
     }
 
     @Test
+    void aMultiLevelWildcardSubscriptionDoesNotReceiveItsParentTopic() throws Exception {
+        String parent = "p/" + System.nanoTime();
+
+        try (MqttTestClient subscriber = connectMqtt("parent-sub")) {
+            subscriber.subscribe(parent + "/#");
+            try (MqttTestClient publisher = connectMqtt("parent-pub")) {
+                publisher.publish(parent, "parent".getBytes(StandardCharsets.UTF_8));
+                publisher.publish(parent + "/", "empty-level".getBytes(StandardCharsets.UTF_8));
+                publisher.publish(parent + "/x", "child".getBytes(StandardCharsets.UTF_8));
+            }
+
+            assertEquals(parent + "/", subscriber.takePublish().topic());
+            assertEquals(parent + "/x", subscriber.takePublish().topic());
+            subscriber.assertNoPublish();
+        }
+    }
+
+    @Test
     void onlyASubscriptionNamingTheTopicExactlyReceivesItsRetainedMessage() throws Exception {
         String device = "phase/retained/" + System.nanoTime();
         String topic = device + "/state";

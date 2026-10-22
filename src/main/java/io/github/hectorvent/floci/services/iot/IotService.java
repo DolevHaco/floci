@@ -2143,8 +2143,9 @@ public class IotService {
         int i = 0;
         for (; i < filterParts.length; i++) {
             String filterPart = filterParts[i];
+            // AWS IoT: sensor/# matches sensor/ and below, but not the parent topic sensor.
             if ("#".equals(filterPart)) {
-                return i == filterParts.length - 1;
+                return i == filterParts.length - 1 && i < topicParts.length;
             }
             if (i >= topicParts.length) {
                 return false;
