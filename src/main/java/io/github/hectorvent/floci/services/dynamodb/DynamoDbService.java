@@ -2423,6 +2423,46 @@ public class DynamoDbService {
     }
 
     public TransactGetResult transactGetItems(List<JsonNode> transactItems, String region) {
+        // Holding every participant's item lock, taken in the order applyTransactWrite takes them,
+        // isolates the reads from a concurrent TransactWriteItems: they see all of it or none.
+        TreeMap<TransactParticipant, ReentrantLock> toAcquire = new TreeMap<>(PARTICIPANT_ORDER);
+        for (JsonNode transactItem : transactItems) {
+            TransactParticipant participant = resolveGetParticipant(transactItem, region);
+            if (participant != null) {
+                toAcquire.putIfAbsent(participant, lockFor(participant.storageKey(), participant.itemKey()));
+            }
+        }
+        List<ReentrantLock> acquired = new ArrayList<>(toAcquire.size());
+        try {
+            for (ReentrantLock lock : toAcquire.values()) {
+                lock.lock();
+                acquired.add(lock);
+            }
+            return readTransactGetItems(transactItems, region);
+        } finally {
+            for (int i = acquired.size() - 1; i >= 0; i--) {
+                acquired.get(i).unlock();
+            }
+        }
+    }
+
+    private TransactParticipant resolveGetParticipant(JsonNode transactItem, String region) {
+        JsonNode get = transactItem.get("Get");
+        if (get == null || get.get("Key") == null) {
+            return null;
+        }
+        try {
+            String tableName = canonicalTableName(region, get.path("TableName").asText());
+            String storageKey = regionKey(region, tableName);
+            TableDefinition table = requireActiveTable(storageKey);
+            return new TransactParticipant(storageKey, buildItemKey(table, get.get("Key"), true), tableName);
+        } catch (AwsException ignored) {
+            // The read of this member fails the same way and reports it there.
+            return null;
+        }
+    }
+
+    private TransactGetResult readTransactGetItems(List<JsonNode> transactItems, String region) {
         List<JsonNode> results = new ArrayList<>();
         Map<String, DynamoDbWriteCapacity.Cost> capacity = new LinkedHashMap<>();
         List<TransactionCanceledException.CancellationReason> cancelReasons = new ArrayList<>();

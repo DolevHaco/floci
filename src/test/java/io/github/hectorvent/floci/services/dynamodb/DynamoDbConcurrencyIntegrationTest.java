@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.dynamodb.model.ConditionalCheckFailed
 import io.github.hectorvent.floci.services.dynamodb.model.DynamoDbStreamRecord;
 import io.github.hectorvent.floci.services.dynamodb.model.KeySchemaElement;
 import io.github.hectorvent.floci.services.dynamodb.model.KinesisStreamingDestination;
+import io.github.hectorvent.floci.services.dynamodb.model.PointInTimeChange;
 import io.github.hectorvent.floci.services.dynamodb.model.StreamDescription;
 import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
 import io.github.hectorvent.floci.services.kinesis.KinesisService;
@@ -24,6 +25,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Test;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -34,7 +36,11 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -761,6 +767,143 @@ class DynamoDbConcurrencyIntegrationTest {
         assertEquals(1, successes.get(),
                 "exactly one PutItem with Expected Exists:false should succeed under contention");
         assertEquals(OPS_PER_SCENARIO - 1, conditionalFailures.get());
+    }
+
+    private ObjectNode getTx(String pk) {
+        ObjectNode get = mapper.createObjectNode();
+        get.put("TableName", "Counters");
+        get.set("Key", pkKey(pk));
+        ObjectNode wrapper = mapper.createObjectNode();
+        wrapper.set("Get", get);
+        return wrapper;
+    }
+
+    private ObjectNode setVersionTx(String pk, ObjectNode exprValues) {
+        ObjectNode update = mapper.createObjectNode();
+        update.put("TableName", "Counters");
+        update.set("Key", pkKey(pk));
+        update.put("UpdateExpression", "SET version = :v");
+        update.set("ExpressionAttributeValues", exprValues);
+        ObjectNode wrapper = mapper.createObjectNode();
+        wrapper.set("Update", update);
+        return wrapper;
+    }
+
+    private void seedVersionedPair() {
+        for (String pk : List.of("txA", "txB")) {
+            ObjectNode seed = itemWithPk(pk);
+            seed.set("version", numberAttr("0"));
+            service.putItem("Counters", seed, "us-east-1");
+        }
+    }
+
+    private static String versionOf(JsonNode item) {
+        return item.path("version").path("N").asText();
+    }
+
+    private static void awaitDoneOrParked(Future<?> task, Thread thread) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!task.isDone() && thread.getState() != Thread.State.WAITING && System.nanoTime() < deadline) {
+            Thread.sleep(1);
+        }
+    }
+
+    @RepeatedTest(REPEATS)
+    void transactGetItems_doesNotSeeATransactWriteHalfApplied() throws Exception {
+        // Point-in-time recovery records each changed participant just before the commit writes
+        // it, so parking that record for txB holds the writer after txA is written and before
+        // txB is.
+        CountDownLatch writerPaused = new CountDownLatch(1);
+        CountDownLatch releaseWriter = new CountDownLatch(1);
+        AtomicReference<String> pauseBeforeRecording = new AtomicReference<>();
+        StorageBackend<String, TableDefinition> tableStore = new InMemoryStorage<>();
+        StorageBackend<String, PointInTimeChange> changes = new InMemoryStorage<>() {
+            @Override
+            public void put(String key, PointInTimeChange change) {
+                if (change.getItemKey().equals(pauseBeforeRecording.get())) {
+                    writerPaused.countDown();
+                    try {
+                        releaseWriter.await(10, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                super.put(key, change);
+            }
+        };
+        service = new DynamoDbService(tableStore, new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), changes,
+                new RegionResolver("us-east-1", "000000000000"), null, null, null, mapper, 0, 0, 0,
+                Clock.systemUTC());
+        createCounterTable("us-east-1");
+        seedVersionedPair();
+        TableDefinition table = tableStore.get("us-east-1::Counters").orElseThrow();
+        table.setPointInTimeRecoveryEnabled(true);
+        table.setPointInTimeRecoveryRecoveryPeriodInDays(35);
+        ObjectNode exprValues = mapper.createObjectNode();
+        exprValues.set(":v", numberAttr("1"));
+        pauseBeforeRecording.set("txB");
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> writer = pool.submit(() -> service.transactWriteItems(
+                    List.of(setVersionTx("txA", exprValues), setVersionTx("txB", exprValues)),
+                    "us-east-1", null, null));
+            assertTrue(writerPaused.await(10, TimeUnit.SECONDS), "the writer never reached its second participant");
+
+            CountDownLatch readerStarted = new CountDownLatch(1);
+            AtomicReference<Thread> readerThread = new AtomicReference<>();
+            Future<DynamoDbService.TransactGetResult> reader = pool.submit(() -> {
+                readerThread.set(Thread.currentThread());
+                readerStarted.countDown();
+                return service.transactGetItems(List.of(getTx("txA"), getTx("txB")), "us-east-1");
+            });
+            assertTrue(readerStarted.await(10, TimeUnit.SECONDS));
+            awaitDoneOrParked(reader, readerThread.get());
+            releaseWriter.countDown();
+            writer.get(10, TimeUnit.SECONDS);
+
+            List<JsonNode> items = reader.get(10, TimeUnit.SECONDS).items();
+            assertEquals(versionOf(items.get(0)), versionOf(items.get(1)),
+                    () -> "TransactGetItems saw a TransactWriteItems half applied: " + items);
+            assertEquals("1", versionOf(items.get(0)));
+        } finally {
+            releaseWriter.countDown();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS), "thread pool did not terminate");
+        }
+    }
+
+    @RepeatedTest(REPEATS)
+    void concurrent_transactGetItems_sees_transactWriteItems_all_or_nothing() throws InterruptedException {
+        createCounterTable("us-east-1");
+        seedVersionedPair();
+        AtomicInteger threadId = new AtomicInteger();
+        AtomicInteger versionSource = new AtomicInteger();
+        List<String> tornReads = Collections.synchronizedList(new ArrayList<>());
+
+        List<Throwable> errors = runConcurrently(THREADS, () -> {
+            boolean writer = threadId.getAndIncrement() % 2 == 0;
+            for (int i = 0; i < OPS_PER_SCENARIO; i++) {
+                if (writer) {
+                    ObjectNode exprValues = mapper.createObjectNode();
+                    exprValues.set(":v", numberAttr(String.valueOf(versionSource.incrementAndGet())));
+                    service.transactWriteItems(
+                            List.of(setVersionTx("txA", exprValues), setVersionTx("txB", exprValues)),
+                            "us-east-1", null, null);
+                } else {
+                    List<JsonNode> items = service.transactGetItems(
+                            List.of(getTx("txA"), getTx("txB")), "us-east-1").items();
+                    if (!versionOf(items.get(0)).equals(versionOf(items.get(1)))) {
+                        tornReads.add(versionOf(items.get(0)) + "/" + versionOf(items.get(1)));
+                    }
+                }
+            }
+        });
+
+        assertTrue(errors.isEmpty(), () -> "unexpected errors: " + errors);
+        assertTrue(tornReads.isEmpty(),
+                () -> "TransactGetItems saw half-applied transactions (txA/txB versions): " + tornReads);
     }
 
     @Test
