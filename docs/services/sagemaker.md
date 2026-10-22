@@ -42,7 +42,7 @@ Floci emulates SageMaker control-plane APIs and runs real Docker containers for 
 
 ## Training contract
 
-`CreateTrainingJob` starts `AlgorithmSpecification.TrainingImage` with command `train` unless `ContainerEntrypoint`/`ContainerArguments` are supplied. Floci writes SageMaker config files under `/opt/ml/input/config`, downloads channel data from S3 into `/opt/ml/input/data/<channel>`, waits for container exit, and uploads `/opt/ml/model` as `model.tar.gz` under `OutputDataConfig.S3OutputPath/<TrainingJobName>/output/`.
+`CreateTrainingJob` starts `AlgorithmSpecification.TrainingImage` with command `train` unless `ContainerEntrypoint`/`ContainerArguments` are supplied. Floci writes SageMaker config files under `/opt/ml/input/config`, downloads every object under each channel's `S3Uri` prefix into `/opt/ml/input/data/<channel>` (keeping the folder structure below the prefix and skipping zero-byte folder-marker keys that end in `/`), waits for container exit, and uploads `/opt/ml/model` as `model.tar.gz` under `OutputDataConfig.S3OutputPath/<TrainingJobName>/output/`.
 
 ## GPU-backed training
 

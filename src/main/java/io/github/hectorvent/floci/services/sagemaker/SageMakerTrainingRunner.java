@@ -268,17 +268,23 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
         }
         String s3Uri = String.valueOf(s3ds.get("S3Uri"));
         S3Uri uri = S3Uri.parse(s3Uri);
-        List<S3Object> objects = uri.key().isBlank()
-                ? s3Service.listObjects(uri.bucket(), "", null, 1000)
-                : s3Service.listObjects(uri.bucket(), uri.key(), null, 1000);
-        for (S3Object object : objects) {
-            S3Object full = s3Service.getObject(uri.bucket(), object.getKey());
-            String relative = relativeToPrefix(uri.key(), object.getKey());
-            String safeRelative = safeRelativePath(relative);
-            if (safeRelative != null && !safeRelative.isBlank()) {
-                SageMakerEndpointManager.addFile(tar, "opt/ml/input/data/" + channelName + "/" + safeRelative, full.getData());
+        String token = null;
+        do {
+            S3Service.ListObjectsResult page = s3Service.listObjectsWithPrefixes(uri.bucket(), uri.key(), null, 1000, token, null);
+            for (S3Object object : page.objects()) {
+                // A folder marker has no data, and as a file it would collide with the folder's own objects.
+                if (object.getKey().endsWith("/")) {
+                    continue;
+                }
+                S3Object full = s3Service.getObject(uri.bucket(), object.getKey());
+                String relative = relativeToPrefix(uri.key(), object.getKey());
+                String safeRelative = safeRelativePath(relative);
+                if (safeRelative != null && !safeRelative.isBlank()) {
+                    SageMakerEndpointManager.addFile(tar, "opt/ml/input/data/" + channelName + "/" + safeRelative, full.getData());
+                }
             }
-        }
+            token = page.isTruncated() ? page.nextContinuationToken() : null;
+        } while (token != null);
     }
 
     /**
