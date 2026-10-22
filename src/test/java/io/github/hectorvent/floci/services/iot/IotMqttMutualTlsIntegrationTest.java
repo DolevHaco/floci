@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.testing.IotMqttTlsProfile;
 import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
+import io.restassured.specification.RequestSpecification;
 import org.eclipse.paho.client.mqttv3.MqttClient;
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
 import org.eclipse.paho.client.mqttv3.MqttException;
@@ -14,19 +15,24 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
 import javax.net.ssl.SSLSocketFactory;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -45,6 +51,7 @@ class IotMqttMutualTlsIntegrationTest {
     /** The name the device dials, which Paho also sends as the TLS server name. */
     static final String DOMAIN = "localhost";
 
+    private static final String OTHER_ACCOUNT = "111100000013";
     private static final String CONNECT_ANY_CLIENT = policy("Allow", "arn:aws:iot:*:*:client/*", null);
     private static final String CONNECT_AS_ATTACHED_THING =
             policy("Allow", "arn:aws:iot:*:*:client/${iot:Connection.Thing.ThingName}", null);
@@ -271,6 +278,112 @@ class IotMqttMutualTlsIntegrationTest {
         } finally {
             pool.shutdownNow();
         }
+    }
+
+    @Test
+    void aDevicePublishUsesTheRulesAndRetainedMessagesOfItsCertificatesAccount() throws Exception {
+        String authorization = signedBy(OTHER_ACCOUNT, "iot");
+        IotDeviceIdentity device = IotDeviceIdentity.provision(true, authorization, cleanup);
+        device.attachNewPolicy(CONNECT_ANY_CLIENT, cleanup);
+        String topic = "devices/account-" + System.nanoTime() + "/telemetry";
+        String deviceQueue = createQueue(signedBy(OTHER_ACCOUNT, "sqs"), "device-account-" + System.nanoTime());
+        String defaultQueue = createQueue(null, "default-account-" + System.nanoTime());
+        createSqsRule(authorization, "deviceAccountRule" + System.nanoTime(), topic, deviceQueue);
+        createSqsRule(null, "defaultAccountRule" + System.nanoTime(), topic, defaultQueue);
+        cleanup.register(() -> given().header("Authorization", authorization).contentType("application/octet-stream")
+                .queryParam("retain", true).body(new byte[0]).when().post("/topics/" + topic).then().statusCode(200));
+
+        MqttClient publisher = connectTls(device, "account-pub-" + System.nanoTime());
+        publisher.publish(topic, "telemetry".getBytes(StandardCharsets.UTF_8), 1, true);
+        publisher.disconnect();
+        publisher.close();
+
+        assertEquals(List.of("telemetry"), awaitMessages(deviceQueue), "the rule of the device's account fired");
+        assertEquals(List.of(), receiveMessages(defaultQueue), "the default account's rule did not");
+        given()
+            .header("Authorization", authorization)
+        .when()
+            .get("/retainedMessage/" + topic)
+        .then()
+            .statusCode(200)
+            .body("payload", equalTo(Base64.getEncoder().encodeToString("telemetry".getBytes(StandardCharsets.UTF_8))));
+        given().when().get("/retainedMessage/" + topic).then().statusCode(404);
+
+        BlockingQueue<String> deviceAccount = new LinkedBlockingQueue<>();
+        BlockingQueue<String> defaultAccount = new LinkedBlockingQueue<>();
+        MqttClient subscriber = connectTls(device, "account-sub-" + System.nanoTime());
+        MqttClient plain = connect("tcp://127.0.0.1:" + PLAIN_PORT, "default-sub-" + System.nanoTime(), null);
+        try {
+            subscriber.subscribe(topic, 1, (received, message) -> deviceAccount.add(new String(message.getPayload(), StandardCharsets.UTF_8)));
+            plain.subscribe(topic, 1, (received, message) -> defaultAccount.add(new String(message.getPayload(), StandardCharsets.UTF_8)));
+
+            assertEquals("telemetry", deviceAccount.poll(5, TimeUnit.SECONDS), "a session of the device's account gets its retained message");
+            assertNull(defaultAccount.poll(1, TimeUnit.SECONDS), "a plaintext session, in the default account, does not");
+        } finally {
+            subscriber.disconnect();
+            subscriber.close();
+            plain.disconnect();
+            plain.close();
+        }
+    }
+
+    private static String signedBy(String account, String service) {
+        return "AWS4-HMAC-SHA256 Credential=" + account + "/20260215/us-east-1/" + service + "/aws4_request, "
+                + "SignedHeaders=host, Signature=abc";
+    }
+
+    private String createQueue(String authorization, String queueName) {
+        return (authorization == null ? given() : given().header("Authorization", authorization))
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateQueue")
+            .formParam("QueueName", queueName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().xmlPath().getString("CreateQueueResponse.CreateQueueResult.QueueUrl");
+    }
+
+    private void createSqsRule(String authorization, String ruleName, String topic, String queueUrl) {
+        RequestSpecification request = authorization == null ? given() : given().header("Authorization", authorization);
+        request
+            .contentType("application/json")
+            .body("""
+                {"topicRulePayload": {"sql": "SELECT * FROM '%s'",
+                  "actions": [{"sqs": {"roleArn": "arn:aws:iam::000000000000:role/iot-rule-role", "queueUrl": "%s"}}]}}
+                """.formatted(topic, queueUrl))
+        .when()
+            .put("/rules/" + ruleName)
+        .then()
+            .statusCode(200);
+        cleanup.register(() -> (authorization == null ? given() : given().header("Authorization", authorization))
+                .when().delete("/rules/" + ruleName).then().statusCode(200));
+    }
+
+    private static List<String> receiveMessages(String queueUrl) {
+        return given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ReceiveMessage")
+            .formParam("QueueUrl", queueUrl)
+            .formParam("MaxNumberOfMessages", "10")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().xmlPath().getList("ReceiveMessageResponse.ReceiveMessageResult.Message.Body", String.class);
+    }
+
+    /** The first non-empty receive on the queue within five seconds, as the rule runs on the broker's rule worker. */
+    private static List<String> awaitMessages(String queueUrl) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (System.currentTimeMillis() < deadline) {
+            List<String> received = receiveMessages(queueUrl);
+            if (!received.isEmpty()) {
+                return received;
+            }
+            Thread.sleep(25);
+        }
+        return List.of();
     }
 
     private IotDeviceIdentity provisionWithPolicy(boolean active, String document) {

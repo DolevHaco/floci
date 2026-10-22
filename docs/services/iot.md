@@ -14,7 +14,7 @@ Supported MVP 1 behavior:
 - Policy basics: `CreatePolicy`, `GetPolicy`, `ListPolicies`, `DeletePolicy`, policy version lifecycle, `AttachPolicy`, `DetachPolicy`, `ListAttachedPolicies`, and `ListTargetsForPolicy`.
 - Thing principal basics: `AttachThingPrincipal`, `DetachThingPrincipal`, `ListThingPrincipals`, `ListPrincipalThings`, and the paginated `ListThingPrincipalsV2` and `ListPrincipalThingsV2`. Exclusive attachment is not modelled, so the V2 lists report every attachment as `NON_EXCLUSIVE_THING`, and a `thingPrincipalType` filter of `EXCLUSIVE_THING` returns none.
 - Tags for things, certificates, policies, and topic rules.
-- IoT Data retained messages: retained `Publish`, `GetRetainedMessage`, and paginated `ListRetainedMessages`. Both read actions report `lastModifiedTime` as integer epoch milliseconds, as required by the IoT Data API. As on AWS IoT, an MQTT subscription receives a retained message only when its topic filter names that topic exactly; a filter with `+` or `#` receives none.
+- IoT Data retained messages: retained `Publish`, `GetRetainedMessage`, and paginated `ListRetainedMessages`. Both read actions report `lastModifiedTime` as integer epoch milliseconds, as required by the IoT Data API. As on AWS IoT, an MQTT subscription receives a retained message only when its topic filter names that topic exactly; a filter with `+` or `#` receives none. An MQTT publish keeps its retained message in its session's account (see [Rules Engine](#rules-engine)), and a subscription receives the retained messages of its own session's account.
 - Shadow null-delete and version-conflict behavior for HTTP and shared service paths.
 - Topic rule duplicate/delete/replace semantics, plus `republish`, `sqs`, `sns`, `s3`, `dynamoDBv2`, `kinesis`, `lambda`, `firehose`, and `cloudwatchLogs` action dispatch.
 
@@ -289,7 +289,7 @@ in AWS's order:
 | IoT Data `DeleteConnection` | `API_INITIATED_DISCONNECT` |
 | A PUBLISH above 128 KB, or a QoS 2 PUBLISH | `CLIENT_ERROR` |
 
-An event goes the way a client publish goes: it is evaluated by the topic rules of every region,
+An event goes the way a client publish goes: it is evaluated by the topic rules of every region of the session's account,
 where `clientid()` returns the client id the event is about and `topic(3)` is `presence`, and
 delivered to matching MQTT subscribers. As on AWS, a topic filter whose first level is `#` or `+`
 does not match the lifecycle topics, both for subscriptions and for a rule's `FROM`: `#` and
@@ -402,6 +402,7 @@ Supported rule behavior:
 - IoT Data `Publish` and MQTT publishes use the same rule dispatch path. An IoT Data `Publish` evaluates its rules before it returns. An MQTT publish evaluates them on the broker's rule worker, so neither its PUBACK nor its fan-out waits for rule actions, and a republished message can reach subscribers before or after the source message's other deliveries; AWS gives no ordering guarantee there either.
 - Rule matching is region-scoped: an IoT Data `Publish` evaluates the rules of the region named by its SigV4 credential, and a rule's actions target the rule's own region.
 - Publishes that carry no region (MQTT, or an IoT Data `Publish` whose `Authorization` header is absent or not SigV4) are evaluated against every region's rules.
+- An MQTT publish, a Last Will and a lifecycle event are evaluated against the rules of their session's account, as the AWS topic namespace belongs to an account: the device certificate's account for a session on the TLS listener, the default account for a plaintext or WebSocket session. Their rule actions still run without a request account, so an action whose target is looked up by name in the caller's account, such as a Kinesis stream, a Firehose delivery stream or a CloudWatch Logs group, is looked up in the default account.
 - Device shadow events on the `$aws/things/...` response topics reach rules as well, evaluated only against the rules of the shadow's region; see [Shadow Events](#shadow-events).
 - Actions receive the projected document, which is the payload itself for a statement that selects only `*`.
 - `republish` action republishes to another MQTT topic through `IotMqttBrokerService`.

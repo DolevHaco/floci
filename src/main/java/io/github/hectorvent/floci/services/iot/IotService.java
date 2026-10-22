@@ -689,12 +689,37 @@ public class IotService {
                 .toList();
     }
 
+    /** The account helpers use the request's account when {@code accountId} is null. */
     private static <V> Optional<V> getForAccount(StorageBackend<String, V> store, String accountId, String key) {
-        return store instanceof AccountAwareStorageBackend<V> aware ? aware.getForAccount(accountId, key) : store.get(key);
+        return accountId != null && store instanceof AccountAwareStorageBackend<V> aware
+                ? aware.getForAccount(accountId, key)
+                : store.get(key);
     }
 
     private static <V> Set<String> keysForAccount(StorageBackend<String, V> store, String accountId) {
         return store instanceof AccountAwareStorageBackend<V> aware ? aware.keysForAccount(accountId) : store.keys();
+    }
+
+    private static <V> List<V> scanForAccount(StorageBackend<String, V> store, String accountId, Predicate<String> keyFilter) {
+        return accountId != null && store instanceof AccountAwareStorageBackend<V> aware
+                ? aware.scanForAccount(accountId, keyFilter)
+                : store.scan(keyFilter);
+    }
+
+    private static <V> void putForAccount(StorageBackend<String, V> store, String accountId, String key, V value) {
+        if (accountId != null && store instanceof AccountAwareStorageBackend<V> aware) {
+            aware.putForAccount(accountId, key, value);
+        } else {
+            store.put(key, value);
+        }
+    }
+
+    private static <V> void deleteForAccount(StorageBackend<String, V> store, String accountId, String key) {
+        if (accountId != null && store instanceof AccountAwareStorageBackend<V> aware) {
+            aware.deleteForAccount(accountId, key);
+        } else {
+            store.delete(key);
+        }
     }
 
     public IotPolicy createPolicy(String policyName, String policyDocument, String region) {
@@ -1224,20 +1249,29 @@ public class IotService {
      */
     public void publish(String topic, byte[] payload, boolean retain, int qos, String region, String clientId,
                         Executor ruleRunner) {
+        publish(topic, payload, retain, qos, region, clientId, null, ruleRunner);
+    }
+
+    /**
+     * {@code accountId} is the account the message belongs to, whose retained message it sets and
+     * whose rules it runs through; null for the request's account.
+     */
+    public void publish(String topic, byte[] payload, boolean retain, int qos, String region, String clientId,
+                        String accountId, Executor ruleRunner) {
         byte[] eventPayload = payload == null ? new byte[0] : payload;
         if (retain) {
             if (eventPayload.length == 0) {
-                retainedMessageStore.delete(retainedMessageKey(topic));
+                deleteForAccount(retainedMessageStore, accountId, retainedMessageKey(topic));
             } else {
                 IotRetainedMessage retained = new IotRetainedMessage();
                 retained.setTopic(topic);
                 retained.setPayload(Base64.getEncoder().encodeToString(eventPayload));
                 retained.setQos(qos);
                 retained.setLastModifiedTime(Instant.now());
-                retainedMessageStore.put(retainedMessageKey(topic), retained);
+                putForAccount(retainedMessageStore, accountId, retainedMessageKey(topic), retained);
             }
         }
-        handlePublish(topic, eventPayload, true, region, clientId, ruleRunner);
+        handlePublish(topic, eventPayload, true, region, clientId, accountId, ruleRunner);
     }
 
     /**
@@ -1281,12 +1315,12 @@ public class IotService {
     }
 
     public IotRetainedMessage getRetainedMessage(String topic) {
-        return findRetainedMessage(topic)
+        return retainedMessageStore.get(retainedMessageKey(topic))
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Retained message not found: " + topic, 404));
     }
 
-    Optional<IotRetainedMessage> findRetainedMessage(String topic) {
-        return retainedMessageStore.get(retainedMessageKey(topic));
+    Optional<IotRetainedMessage> findRetainedMessage(String accountId, String topic) {
+        return getForAccount(retainedMessageStore, accountId, retainedMessageKey(topic));
     }
 
     public Page<IotRetainedMessage> listRetainedMessages(Integer maxResults, String nextToken) {
@@ -1651,13 +1685,18 @@ public class IotService {
 
     void handlePublish(String topic, byte[] payload, boolean evaluateRules, String region, String clientId,
                        Executor ruleRunner) {
+        handlePublish(topic, payload, evaluateRules, region, clientId, null, ruleRunner);
+    }
+
+    void handlePublish(String topic, byte[] payload, boolean evaluateRules, String region, String clientId,
+                       String accountId, Executor ruleRunner) {
         byte[] eventPayload = payload == null ? new byte[0] : payload;
         publishEventRecorder.record(topic, eventPayload);
         if (!evaluateRules) {
             return;
         }
         ruleRunner.execute(() -> {
-            for (IotTopicRule rule : rulesForPublish(region)) {
+            for (IotTopicRule rule : rulesForPublish(region, accountId)) {
                 if (!rule.isRuleDisabled()) {
                     matchAndProject(rule, topic, clientId, eventPayload)
                             .ifPresent(document -> executeTopicRule(rule, topic, eventPayload, document));
@@ -1698,12 +1737,13 @@ public class IotService {
         return compiled.query();
     }
 
-    private List<IotTopicRule> rulesForPublish(String region) {
+    /** The rules of {@code accountId}, or of the request's account when it is null. */
+    private List<IotTopicRule> rulesForPublish(String region, String accountId) {
         if (region != null) {
             return listTopicRules(region);
         }
         // MQTT and unsigned data-plane publishes carry no region, so every region's rules apply.
-        return topicRuleStore.scan(key -> true).stream()
+        return scanForAccount(topicRuleStore, accountId, key -> true).stream()
                 .sorted(Comparator.comparing(IotTopicRule::getRuleName))
                 .toList();
     }

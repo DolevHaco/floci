@@ -754,9 +754,19 @@ public class IotMqttBrokerService implements Resettable {
             return;
         }
 
-        iotService.get().publish(topic, payload, retain, qos, null, session.clientId(),
-                rules -> evaluateRulesOnWorker(topic, rules, admitted));
+        publishAsSession(session, topic, payload, retain, qos, admitted);
         fanOut(topic, payload, qos);
+    }
+
+    /**
+     * Stores, records and hands to the rule worker a message of the session in its account, which
+     * the topic namespace, retained messages and rules belong to on AWS: the device certificate's
+     * account on the TLS listener, the default one otherwise. The account is passed explicitly
+     * rather than through a request scope, which the rule worker would share with this event loop.
+     */
+    private void publishAsSession(ClientSession session, String topic, byte[] payload, boolean retain, int qos, long admitted) {
+        iotService.get().publish(topic, payload, retain, qos, null, session.clientId(), session.accountId(),
+                rules -> evaluateRulesOnWorker(topic, rules, admitted));
     }
 
     /**
@@ -846,7 +856,7 @@ public class IotMqttBrokerService implements Resettable {
 
     /**
      * As on AWS IoT, only a topic filter without wildcards receives a retained message: the one
-     * stored for exactly that topic.
+     * stored for exactly that topic in the session's account.
      */
     private void deliverRetained(ClientSession session, List<Subscription> subscriptions) {
         Set<String> deliveredTopics = new HashSet<>();
@@ -855,7 +865,7 @@ public class IotMqttBrokerService implements Resettable {
             if (topic.contains("+") || topic.contains("#") || !deliveredTopics.add(topic)) {
                 continue;
             }
-            Optional<IotRetainedMessage> retained = iotService.get().findRetainedMessage(topic);
+            Optional<IotRetainedMessage> retained = iotService.get().findRetainedMessage(session.accountId(), topic);
             if (retained.isEmpty()) {
                 continue;
             }
@@ -940,8 +950,7 @@ public class IotMqttBrokerService implements Resettable {
         // Its rules are admitted under the rule state at the time of the event.
         long admitted = ruleState.get();
         vertx.runOnContext(ignored -> {
-            iotService.get().publish(topic, payload, false, 0, null, session.clientId(),
-                    rules -> evaluateRulesOnWorker(topic, rules, admitted));
+            publishAsSession(session, topic, payload, false, 0, admitted);
             fanOut(topic, payload, 0);
         });
     }

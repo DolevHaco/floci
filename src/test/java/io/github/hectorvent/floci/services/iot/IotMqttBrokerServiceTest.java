@@ -1753,9 +1753,9 @@ class IotMqttBrokerServiceTest {
         when(iotService.get()).thenReturn(service);
         AtomicBoolean rulesRan = new AtomicBoolean();
         doAnswer(invocation -> {
-            invocation.<Executor>getArgument(6).execute(() -> rulesRan.set(true));
+            invocation.<Executor>getArgument(7).execute(() -> rulesRan.set(true));
             return null;
-        }).when(service).publish(eq(topic), any(), anyBoolean(), anyInt(), any(), any(), any());
+        }).when(service).publish(eq(topic), any(), anyBoolean(), anyInt(), any(), any(), any(), any());
         MqttEndpoint endpoint = mock(MqttEndpoint.class);
         when(endpoint.clientIdentifier()).thenReturn("reset-race");
         broker.handleEndpoint(endpoint, false);
@@ -1773,7 +1773,7 @@ class IotMqttBrokerServiceTest {
         assertTrue(eventHandled.await(10, TimeUnit.SECONDS), "the queued lifecycle event was handled");
         broker.ruleWorker.executeBlocking(() -> null, false).toCompletionStage().toCompletableFuture().get(10, TimeUnit.SECONDS);
         assertTrue(disconnected.get(), "DeleteConnection ended the session");
-        verify(service).publish(eq(topic), any(), anyBoolean(), anyInt(), any(), any(), any());
+        verify(service).publish(eq(topic), any(), anyBoolean(), anyInt(), any(), any(), any(), any());
         assertFalse(rulesRan.get(), "the event's rules, admitted before the reset, were skipped");
     }
 
