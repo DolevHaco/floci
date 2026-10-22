@@ -429,12 +429,13 @@ public class DynamoDbService {
             itemStore.delete(storageKey);
             return;
         }
-        storeSnapshot(scopedKey, items, snapshot -> itemStore.put(storageKey, snapshot));
+        storeSnapshot(scopedKey, regionResolver.getAccountId(), storageKey, items,
+                snapshot -> itemStore.put(storageKey, snapshot));
     }
 
     // A copy numbered n holds every write finished before n was taken, so storing only higher numbers keeps them all.
-    private void storeSnapshot(String scopedKey, ConcurrentSkipListMap<String, JsonNode> items,
-                               Consumer<Map<String, JsonNode>> store) {
+    private void storeSnapshot(String scopedKey, String accountId, String storageKey,
+                               ConcurrentSkipListMap<String, JsonNode> items, Consumer<Map<String, JsonNode>> store) {
         if (itemStore == null) return;
         SnapshotOrder order = snapshotOrder(scopedKey, items);
         if (order == null) {
@@ -443,12 +444,19 @@ public class DynamoDbService {
         long number = order.taken.incrementAndGet();
         Map<String, JsonNode> snapshot = new HashMap<>(items);
         itemsByTable.computeIfPresent(scopedKey, (key, live) -> {
-            if (live == items && number > order.stored.get()) {
+            if (live == items && number > order.stored.get() && tableExists(accountId, storageKey)) {
                 store.accept(snapshot);
                 order.stored.set(number);
             }
             return live;
         });
+    }
+
+    private boolean tableExists(String accountId, String storageKey) {
+        if (accountId != null && tableStore instanceof AccountAwareStorageBackend<TableDefinition> aware) {
+            return aware.getForAccount(accountId, storageKey).isPresent();
+        }
+        return tableStore.get(storageKey).isPresent();
     }
 
     private SnapshotOrder snapshotOrder(String scopedKey, ConcurrentSkipListMap<String, JsonNode> items) {
@@ -3276,8 +3284,8 @@ public class DynamoDbService {
             if (deletedForTable > 0 && entryStore == null) {
                 // A DeleteTable during the loop detached this map; writing it back would revive its items.
                 // The copy is taken outside the entry lock and stored only while this map is still the
-                // live one, so a deleted table's items are not written again.
-                storeSnapshot(scan.rawKey(), items,
+                // live one and the table definition still exists.
+                storeSnapshot(scan.rawKey(), scan.accountId(), scan.storageKey(), items,
                         snapshot -> persistItemsForAccount(scan.accountId(), scan.storageKey(), snapshot));
             }
             totalDeleted += deletedForTable;

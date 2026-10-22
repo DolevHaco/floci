@@ -33,6 +33,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.ConcurrentHashMap;
@@ -1013,6 +1014,55 @@ class DynamoDbConcurrencyIntegrationTest {
         for (int i = 0; i < THREADS * OPS_PER_SCENARIO; i++) {
             assertNotNull(restarted.getItem("Counters", pkKey("acked-" + i), "us-east-1"), "acked-" + i);
         }
+    }
+
+    /** A table store whose next get, once armed, reads the table and then parks until released. */
+    private static final class ParkingTableStore extends InMemoryStorage<String, TableDefinition> {
+        private final AtomicBoolean parkNextGet = new AtomicBoolean();
+        private final CountDownLatch parked = new CountDownLatch(1);
+        private final CountDownLatch release = new CountDownLatch(1);
+
+        @Override
+        public Optional<TableDefinition> get(String key) {
+            Optional<TableDefinition> table = super.get(key);
+            if (parkNextGet.compareAndSet(true, false)) {
+                parked.countDown();
+                try {
+                    release.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return table;
+        }
+    }
+
+    @RepeatedTest(REPEATS)
+    void write_that_passed_the_table_check_before_deleteTable_is_not_stored() throws Exception {
+        ParkingTableStore tableStore = new ParkingTableStore();
+        StorageBackend<String, Map<String, JsonNode>> itemStore = new InMemoryStorage<>();
+        service = new DynamoDbService(tableStore, itemStore, new RegionResolver("us-east-1", "000000000000"));
+        createCounterTable("us-east-1");
+        ObjectNode exprValues = mapper.createObjectNode();
+        exprValues.set(":v", numberAttr("1"));
+        tableStore.parkNextGet.set(true);
+
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> write = pool.submit(() -> service.updateItem("Counters", pkKey("late"), null,
+                    "SET lateAttr = :v", null, exprValues, "NONE", "us-east-1"));
+            assertTrue(tableStore.parked.await(10, TimeUnit.SECONDS), "the write never looked up its table");
+            service.deleteTable("Counters", "us-east-1");
+            tableStore.release.countDown();
+            write.get(10, TimeUnit.SECONDS);
+        } finally {
+            tableStore.release.countDown();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS), "thread pool did not terminate");
+        }
+
+        assertTrue(itemStore.get("us-east-1::Counters").isEmpty(),
+                () -> "a deleted table's items must not be stored: " + itemStore.get("us-east-1::Counters"));
     }
 
     @RepeatedTest(REPEATS)
