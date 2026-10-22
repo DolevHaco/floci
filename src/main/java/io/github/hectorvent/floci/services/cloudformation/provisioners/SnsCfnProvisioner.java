@@ -103,8 +103,16 @@ public class SnsCfnProvisioner implements CfnResourceProvisioner {
         List<SubscriptionTarget> desiredSubscriptions = new ArrayList<>();
         if (subscriptions != null && subscriptions.isArray()) {
             for (JsonNode subscription : subscriptions) {
-                desiredSubscriptions.add(new SubscriptionTarget(ctx.resolveOptional(subscription, "Protocol"),
-                        ctx.resolveOptional(subscription, "Endpoint")));
+                String protocol = ctx.resolveOptional(subscription, "Protocol");
+                String endpoint = ctx.resolveOptional(subscription, "Endpoint");
+                // Both are required. Reject the entry before the topic is created, so a bad list
+                // does not leave a topic behind.
+                if (protocol == null || protocol.isBlank() || endpoint == null || endpoint.isBlank()) {
+                    throw new AwsException("ValidationError",
+                            "Each AWS::SNS::Topic Subscription entry requires a Protocol and an Endpoint.",
+                            400);
+                }
+                desiredSubscriptions.add(new SubscriptionTarget(protocol, endpoint));
             }
         }
 
