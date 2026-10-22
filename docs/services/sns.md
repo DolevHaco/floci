@@ -59,11 +59,12 @@ policy set starts from the default one AWS gives a new topic, and `GetTopicAttri
 Under IAM enforcement the topic policy decides what AWS services may publish to the topic, such as
 [SES's event destinations and notifications](ses.md#iam-enforcement), and takes part in an IAM
 caller's request the way any [resource-based policy](iam.md#resource-based-policies) does when the
-request names the topic in a JSON-protocol body. A Query-protocol request carries the topic in its
-form body, which enforcement does not read yet, so the topic policy plays no part in it. A
-Query-protocol request that IAM enforcement refuses answers `AuthorizationError` (HTTP 403), the
-error every SNS operation lists for a caller denied access, which SDKs raise as
-`AuthorizationErrorException`.
+request names the topic, in a Query-protocol form body as every AWS SDK sends it or in a
+JSON-protocol body. Enforcement reads the parameter the handler acts on: the first `TopicArn` in the
+form body of a POST, or in the query string of a Query GET. `CreateTopic` is authorized against the
+ARN of the topic its `Name` would create. A Query-protocol request that IAM enforcement refuses
+answers `AuthorizationError` (HTTP 403), the error every SNS operation lists for a caller denied
+access, which SDKs raise as `AuthorizationErrorException`.
 
 ## SMS sandbox and opt-out
 

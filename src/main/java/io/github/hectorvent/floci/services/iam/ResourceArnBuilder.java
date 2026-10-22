@@ -1420,6 +1420,10 @@ public class ResourceArnBuilder {
     private String buildSqsArn(ContainerRequestContext ctx, String region, String accountId) {
         String queueUrl = firstFormParam(ctx, "QueueUrl");
         if (queueUrl == null) {
+            String formQueueName = firstFormParam(ctx, "QueueName");
+            if (formQueueName != null && !formQueueName.isEmpty()) {
+                return AwsArnUtils.Arn.of("sqs", region, accountId, formQueueName).toString();
+            }
             JsonNode json = readJsonBody(ctx);
             if (json != null && json.isObject()) {
                 if (json.hasNonNull("QueueUrl")) {
@@ -1442,6 +1446,12 @@ public class ResourceArnBuilder {
     // ── SNS ─────────────────────────────────────────────────────────────────────
     private String buildSnsArn(ContainerRequestContext ctx, String region, String accountId) {
         String topicArn = firstFormParam(ctx, "TopicArn");
+        if (topicArn == null && "CreateTopic".equals(firstFormParam(ctx, "Action"))) {
+            String name = firstFormParam(ctx, "Name");
+            if (name != null && !name.isEmpty()) {
+                return AwsArnUtils.Arn.of("sns", region, accountId, name).toString();
+            }
+        }
         if (topicArn == null) {
             JsonNode json = readJsonBody(ctx);
             if (json != null && json.isObject() && json.hasNonNull("TopicArn")) {
