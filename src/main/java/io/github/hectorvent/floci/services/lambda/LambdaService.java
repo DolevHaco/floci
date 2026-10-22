@@ -210,8 +210,8 @@ public class LambdaService implements ResourceProvider {
     private final ConcurrentHashMap<String, Object> policyMutationLocks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> versionCounterLocks = new ConcurrentHashMap<>();
     private final SignedMarkers listFunctionMarkers = new SignedMarkers();
-    /** Makes the duplicate check and the save of a new event source mapping one step. */
-    private final Object eventSourceMappingCreateLock = new Object();
+    /** Makes the duplicate check and the save of a created or repointed event source mapping one step. */
+    private final Object eventSourceMappingConflictLock = new Object();
 
     /**
      * Package-private constructor for testing without CDI. Config defaults
@@ -1595,9 +1595,9 @@ public class LambdaService implements ResourceProvider {
         esm.setTags(requestTags(request));
         esm.setLastModified(System.currentTimeMillis());
 
-        synchronized (eventSourceMappingCreateLock) {
+        synchronized (eventSourceMappingConflictLock) {
             if (eventSourceArn != null) {
-                rejectDuplicateMapping(eventSourceArn, esm.getFunctionArn(), functionName);
+                rejectDuplicateMapping(eventSourceArn, esm.getFunctionArn(), functionName, null);
             }
             if (eventSourceArn != null && eventSourceArn.contains(":dynamodb:")) {
                 dynamodbStreamsPoller.initializeStartingPosition(esm);
@@ -1615,12 +1615,15 @@ public class LambdaService implements ResourceProvider {
 
     /**
      * AWS keeps one mapping per event source ARN and function. A qualifier names a different
-     * function, except {@code $LATEST}, which is the unqualified function.
+     * function, except {@code $LATEST}, which is the unqualified function. {@code excludedUuid}
+     * is the mapping being repointed, which never conflicts with itself.
      */
-    private void rejectDuplicateMapping(String eventSourceArn, String functionArn, String requestedFunctionName) {
+    private void rejectDuplicateMapping(String eventSourceArn, String functionArn, String requestedFunctionName,
+                                        String excludedUuid) {
         String function = withoutLatestQualifier(functionArn);
         for (EventSourceMapping existing : esmStore.list()) {
-            if (eventSourceArn.equals(existing.getEventSourceArn())
+            if (!existing.getUuid().equals(excludedUuid)
+                    && eventSourceArn.equals(existing.getEventSourceArn())
                     && function.equals(withoutLatestQualifier(existing.getFunctionArn()))) {
                 String message = eventSourceArn.contains(":sqs:")
                         ? "An event source mapping with SQS arn (\" " + eventSourceArn + " \") and function (\" "
@@ -2244,6 +2247,8 @@ public class LambdaService implements ResourceProvider {
             changes.add(m -> m.setFunctionResponseTypes(functionResponseTypes));
         }
 
+        ResolvedFunctionTarget newFunction = null;
+        String requestedFunctionName = null;
         if (request.containsKey("FunctionName")) {
             String fnName = (String) request.get("FunctionName");
             if (fnName != null && !fnName.isBlank()) {
@@ -2257,6 +2262,8 @@ public class LambdaService implements ResourceProvider {
                     m.setFunctionArn(target.functionArn());
                     m.setFunctionName(target.functionName());
                 });
+                newFunction = target;
+                requestedFunctionName = fnName;
             }
         }
 
@@ -2302,9 +2309,15 @@ public class LambdaService implements ResourceProvider {
             }
         }
 
-        changes.forEach(change -> change.accept(esm));
-        esm.setLastModified(System.currentTimeMillis());
-        esmStore.save(esm);
+        synchronized (eventSourceMappingConflictLock) {
+            if (newFunction != null && esm.getEventSourceArn() != null) {
+                rejectDuplicateMapping(esm.getEventSourceArn(), newFunction.functionArn(), requestedFunctionName,
+                        esm.getUuid());
+            }
+            changes.forEach(change -> change.accept(esm));
+            esm.setLastModified(System.currentTimeMillis());
+            esmStore.save(esm);
+        }
 
         // Start/stop polling if enabled state changed
         if (!wasEnabled && esm.isEnabled()) {
