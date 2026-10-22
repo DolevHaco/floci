@@ -156,6 +156,10 @@ public class KinesisEventSourcePoller implements Resettable {
         LOG.infov("Started Kinesis polling for ESM {0} → {1}", uuid, esm.getEventSourceArn());
     }
 
+    /**
+     * Taking the monitor drains an in-flight advanceCheckpoint save, and the tombstone stops any
+     * later one, so a stopped or deleted mapping is never written back.
+     */
     public synchronized void stopPolling(String uuid) {
         stopped.add(uuid);
         Long timerId = timerIds.remove(uuid);
@@ -215,6 +219,10 @@ public class KinesisEventSourcePoller implements Resettable {
                         esm.getAccountId(), streamName, esm.getRegion());
 
                 for (KinesisShard shard : stream.getShards()) {
+                    if (isStopped(esm)) {
+                        LOG.debugv("Kinesis ESM {0} was stopped or deleted, ending its poll", esm.getUuid());
+                        return;
+                    }
                     pollShard(esm, fn, streamName, shard.getShardId());
                 }
             } catch (Exception e) {
@@ -441,6 +449,15 @@ public class KinesisEventSourcePoller implements Resettable {
                 .orElse(false);
     }
 
+    /** Same stop rule as the DynamoDB Streams poller: a reset, a tombstone, or a mapping the store has dropped. */
+    private boolean isStopped(EventSourceMapping esm) {
+        return quiesced || stopped.contains(esm.getUuid()) || !exists(esm);
+    }
+
+    private boolean exists(EventSourceMapping esm) {
+        return esmStore.getForAccount(esm.getAccountId(), esm.getUuid()).isPresent();
+    }
+
     private void clearBatchState(String key) {
         retryCounts.remove(key);
         retryNotBefore.remove(key);
@@ -572,7 +589,10 @@ public class KinesisEventSourcePoller implements Resettable {
         return new CheckpointOutcome(previousCheckpoint, 0);
     }
 
-    private void advanceCheckpoint(EventSourceMapping esm, String shardId, String newestSeq) {
+    private synchronized void advanceCheckpoint(EventSourceMapping esm, String shardId, String newestSeq) {
+        if (isStopped(esm)) {
+            return;
+        }
         esm.getShardSequenceNumbers().put(shardId, newestSeq);
         esmStore.saveForAccount(esm.getAccountId(), esm);
     }

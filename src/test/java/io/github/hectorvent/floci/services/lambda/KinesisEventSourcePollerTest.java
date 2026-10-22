@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.kinesis.KinesisService;
 import io.github.hectorvent.floci.services.kinesis.model.KinesisRecord;
@@ -80,6 +81,7 @@ class KinesisEventSourcePollerTest {
     private static final String REGION = "us-east-1";
     private static final String STREAM_ARN = "arn:aws:kinesis:us-east-1:000000000000:stream/s";
     private static final String SHARD = "shardId-000000000000";
+    private static final String SHARD_2 = "shardId-000000000001";
     private static final String FUNCTION_ARN = "arn:aws:lambda:us-east-1:000000000000:function:fn";
     private static final String QUEUE_ARN = "arn:aws:sqs:us-east-1:000000000000:k-dlq";
     private static final String QUEUE_URL = "http://localhost:4566/000000000000/k-dlq";
@@ -552,8 +554,12 @@ class KinesisEventSourcePollerTest {
         when(config.services()).thenReturn(services);
         when(services.lambda()).thenReturn(lambdaConfig);
         when(lambdaConfig.pollIntervalMs()).thenReturn(1000L);
+        when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
         return new KinesisEventSourcePoller(mock(Vertx.class), kinesis, executorService,
-                new LambdaTargetResolver(functionStore, aliasStore), store, config, MAPPER, new PipesFilterMatcher(MAPPER));
+                new LambdaTargetResolver(functionStore, aliasStore), store, config, MAPPER,
+                new PipesFilterMatcher(MAPPER),
+                new StreamBatchFailures(sqsService, snsService, s3Service, MAPPER, config),
+                clock::get);
     }
 
     private static String put(KinesisService kinesis, String data) {
@@ -633,6 +639,100 @@ class KinesisEventSourcePollerTest {
         latestPoller.initializeStartingPosition(esm);
 
         assertTrue(esm.getShardSequenceNumbers().isEmpty());
+    }
+
+    @Test
+    void mappingDeletedDuringASuccessfulInvokeIsNotRecreatedAndNoFurtherShardIsInvoked() {
+        EsmStore store = new EsmStore(new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, ACCOUNT));
+        KinesisEventSourcePoller deletingPoller = pollerOver(kinesisService, store);
+        stubTwoShards();
+        stubFunction();
+        EventSourceMapping esm = esm();
+        store.saveForAccount(ACCOUNT, esm);
+        List<String> invokedEventIds = new CopyOnWriteArrayList<>();
+        AtomicBoolean deleted = new AtomicBoolean();
+        when(executorService.invoke(any(), any(), eq(InvocationType.RequestResponse))).thenAnswer(inv -> {
+            invokedEventIds.add(deliveredRecords(inv.getArgument(1)).get(0).path("eventID").asText());
+            if (deleted.compareAndSet(false, true)) {
+                deletingPoller.stopPolling(esm.getUuid());
+                store.delete(esm.getUuid());
+            }
+            return new InvokeResult();
+        });
+
+        deletingPoller.pollAndInvoke(esm);
+        awaitPollCompletedViaSecondDescribe(deletingPoller, esm);
+
+        assertTrue(store.getForAccount(ACCOUNT, esm.getUuid()).isEmpty(),
+                "a deleted mapping must not reappear in List/Get");
+        assertTrue(esm.getShardSequenceNumbers().isEmpty(), "no checkpoint is written for a deleted mapping");
+        assertFalse(invokedEventIds.stream().anyMatch(id -> id.startsWith(SHARD_2 + ":")),
+                "no shard is invoked after the mapping was deleted, invoked " + invokedEventIds);
+    }
+
+    @Test
+    void mappingDeletedThroughTheServiceSequenceIsNotRecreatedOnceItsTombstoneIsDropped() {
+        EsmStore store = new EsmStore(new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, ACCOUNT));
+        KinesisEventSourcePoller deletingPoller = pollerOver(kinesisService, store);
+        stubTwoShards();
+        stubFunction();
+        EventSourceMapping esm = esm();
+        store.saveForAccount(ACCOUNT, esm);
+        AtomicBoolean deleted = new AtomicBoolean();
+        when(executorService.invoke(any(), any(), eq(InvocationType.RequestResponse))).thenAnswer(inv -> {
+            if (deleted.compareAndSet(false, true)) {
+                deletingPoller.stopPolling(esm.getUuid());
+                store.delete(esm.getUuid());
+                deletingPoller.mappingDeleted(esm.getUuid());
+            }
+            return new InvokeResult();
+        });
+
+        deletingPoller.pollAndInvoke(esm);
+        awaitPollCompletedViaSecondDescribe(deletingPoller, esm);
+
+        assertTrue(store.getForAccount(ACCOUNT, esm.getUuid()).isEmpty(),
+                "a deleted mapping must not reappear in List/Get");
+        assertTrue(esm.getShardSequenceNumbers().isEmpty(), "no checkpoint is written for a deleted mapping");
+    }
+
+    private void stubTwoShards() {
+        KinesisStream stream = new KinesisStream("s", STREAM_ARN);
+        stream.setShards(List.of(new KinesisShard(SHARD, "0", "1", "0"), new KinesisShard(SHARD_2, "2", "3", "0")));
+        when(kinesisService.describeStreamForAccount(eq(ACCOUNT), anyString(), eq(REGION))).thenReturn(stream);
+        when(kinesisService.getShardIteratorForAccount(eq(ACCOUNT), anyString(), eq(SHARD), anyString(), any(), eq(REGION)))
+                .thenReturn("iter-0");
+        when(kinesisService.getShardIteratorForAccount(eq(ACCOUNT), anyString(), eq(SHARD_2), anyString(), any(), eq(REGION)))
+                .thenReturn("iter-1");
+        when(kinesisService.getRecordsForAccount(eq(ACCOUNT), eq("iter-0"), anyInt(), eq(REGION)))
+                .thenReturn(Map.of("Records", List.of(record("s1", "p1", "{}"))));
+        when(kinesisService.getRecordsForAccount(eq(ACCOUNT), eq("iter-1"), anyInt(), eq(REGION)))
+                .thenReturn(Map.of("Records", List.of(record("s2", "p2", "{}"))));
+    }
+
+    /**
+     * Like {@link #awaitPollCompletedViaSecondFetch} for a poller over any stream: once a second poll has described
+     * the stream, the first poll's finally-block ran.
+     */
+    private void awaitPollCompletedViaSecondDescribe(KinesisEventSourcePoller p, EventSourceMapping esm) {
+        long deadline = System.currentTimeMillis() + 5000;
+        while (true) {
+            p.pollAndInvoke(esm);
+            try {
+                verify(kinesisService, atLeast(2)).describeStreamForAccount(eq(ACCOUNT), anyString(), eq(REGION));
+                return;
+            } catch (AssertionError retry) {
+                if (System.currentTimeMillis() > deadline) {
+                    throw retry;
+                }
+                try {
+                    Thread.sleep(25);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw retry;
+                }
+            }
+        }
     }
 
     @Test
