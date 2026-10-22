@@ -129,6 +129,13 @@ Stream records are held in memory. `POST /_floci/state/reset` removes every stre
 tables, so `ListStreams` and `DescribeStream` no longer return the streams of tables created before
 the reset.
 
+Each stream keeps the newest 1000 records, where AWS keeps records for 24 hours. A write past the
+limit trims the oldest record, `TRIM_HORIZON` then starts at the oldest record still held, and an
+iterator positioned before it fails with `TrimmedDataAccessException`. Floci logs a warning when it
+trims records that no `GetRecords` call has returned yet. Raise the limit with
+`FLOCI_SERVICES_DYNAMODB_STREAMS_MAX_RECORDS` when a consumer, such as a Lambda event source
+mapping, can fall further behind than that.
+
 ## Time to Live
 
 With TTL enabled, a sweep runs every 60 seconds and deletes the items whose TTL attribute holds an
@@ -256,6 +263,7 @@ region is rejected.
 | `FLOCI_SERVICES_DYNAMODB_VECTOR_INDEX_ALLOCATION_SECONDS` | `4` | Seconds a vector index added by `UpdateTable` spends in resource allocation |
 | `FLOCI_SERVICES_DYNAMODB_VECTOR_INDEX_BACKFILL_SECONDS` | `10` | Seconds that index then spends backfilling before it goes `ACTIVE` |
 | `FLOCI_SERVICES_DYNAMODB_LATEST_RESTORABLE_LAG_SECONDS` | `300` | Seconds `LatestRestorableDateTime` of point-in-time recovery trails the current time. Set `0` to restore the latest writes with `UseLatestRestorableTime` |
+| `FLOCI_SERVICES_DYNAMODB_STREAMS_MAX_RECORDS` | `1000` | Records each DynamoDB stream keeps in memory before the oldest is trimmed. See [Streams](#streams) |
 | `FLOCI_SERVICES_DYNAMODB_BACKEND` | `native` | Engine behind the DynamoDB API: `native` or `local`, case-insensitive. Any other value fails startup. See [DynamoDB Local backend](#dynamodb-local-backend) |
 | `FLOCI_SERVICES_DYNAMODB_LOCAL_ENDPOINT` | *(none)* | Base URL of DynamoDB Local, for example `http://dynamodb-local:8000`. Required when the backend is `local`. Must be `http` or `https` with a host. AWS endpoints (hosts under `amazonaws.com`, `amazonaws.com.cn` or `api.aws`) are rejected |
 | `FLOCI_SERVICES_DYNAMODB_LOCAL_CONNECT_TIMEOUT_SECONDS` | `2` | Seconds to wait for a connection to DynamoDB Local |
