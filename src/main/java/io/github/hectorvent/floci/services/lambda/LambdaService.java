@@ -1595,6 +1595,8 @@ public class LambdaService implements ResourceProvider {
 
         if (eventSourceArn != null && eventSourceArn.contains(":dynamodb:")) {
             dynamodbStreamsPoller.initializeStartingPosition(esm);
+        } else if (eventSourceArn != null && eventSourceArn.contains(":kinesis:")) {
+            kinesisPoller.initializeStartingPosition(esm);
         }
         esmStore.save(esm);
         if (enabled) {

@@ -1202,6 +1202,8 @@ For Kinesis mappings, a function error leaves the shard checkpoint in place and 
 
 For both stream sources, the first retry waits twice `FLOCI_SERVICES_LAMBDA_POLL_INTERVAL_MS` (2 seconds by default), and each later retry waits twice as long as the one before, up to 60 seconds.
 
+A Kinesis mapping created with `StartingPosition: LATEST` delivers only records written after it is created: each shard that already holds records is pinned at its newest record, and a shard that is empty at creation, or created later by a reshard, is read from its start. With `StartingPosition: AT_TIMESTAMP`, each shard the mapping has not read yet starts at the first record that arrived at or after `StartingPositionTimestamp`. `TRIM_HORIZON` reads every retained record.
+
 For SQS mappings, a function error returns every delivered message to the queue with the queue's `VisibilityTimeout`, so it is received again after that timeout and the queue's `RedrivePolicy` applies as usual. With `FunctionResponseTypes: ["ReportBatchItemFailures"]`, only the messages the function reports are returned and the rest are deleted; a malformed response returns the whole batch.
 
 A DynamoDB Streams mapping created with `StartingPosition: LATEST` delivers only records written after it is created, so a stream that is empty at creation delivers everything written later. After a restart it still resumes from the trim horizon, because native stream records are volatile. Deleting or disabling a mapping stops any poll that has not yet invoked the function. An invocation already running completes, but its checkpoint is not saved: a deleted mapping is never recreated and its result is dropped, and a disabled mapping re-reads that batch when it is enabled again.
