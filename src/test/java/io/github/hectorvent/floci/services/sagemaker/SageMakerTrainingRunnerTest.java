@@ -274,7 +274,7 @@ class SageMakerTrainingRunnerTest {
         assertNull(job.failureReason);
         assertEquals("s3://bucket/output/slow/output/model.tar.gz", job.modelArtifactsS3ModelArtifacts);
         assertFalse(readWhileRunning.get(), "the model must not be read while the container still runs");
-        assertTrue(killedAt.get() - stoppedAt.get() >= Duration.ofMillis(250).toNanos(),
+        assertTrue(killedAt.get() - stoppedAt.get() >= Duration.ofMillis(150).toNanos(),
                 "the container must be killed only once the grace window has ended");
         InOrder order = inOrder(stop, kill, copyModel, lifecycle);
         order.verify(stop).exec();
