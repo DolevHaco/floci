@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.testing.IotMqttTlsProfile;
 import io.github.hectorvent.floci.testing.PartitionCleanup;
+import io.github.hectorvent.floci.testutil.LogCapture;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.specification.RequestSpecification;
@@ -30,6 +31,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
@@ -354,6 +358,51 @@ class IotMqttMutualTlsIntegrationTest {
                 awaitKinesisRecords(kinesisAuthorization, stream), "the record reached the stream of the rule's account");
     }
 
+    /**
+     * DeleteConnection ends the session from an HTTP request in the default account; the Last Will's
+     * rule still runs in its own account, and no rule evaluation fails.
+     */
+    @Test
+    void deleteConnectionRunsTheLastWillsKinesisActionInTheRulesAccount() throws Exception {
+        String authorization = signedBy(OTHER_ACCOUNT, "iot");
+        String kinesisAuthorization = signedBy(OTHER_ACCOUNT, "kinesis");
+        IotDeviceIdentity device = IotDeviceIdentity.provision(true, authorization, cleanup);
+        device.attachNewPolicy(CONNECT_ANY_CLIENT, cleanup);
+        String willTopic = "devices/will-" + System.nanoTime() + "/status";
+        String stream = "iot-will-stream-" + System.nanoTime();
+        kinesis(kinesisAuthorization, "CreateStream", "{\"StreamName\": \"" + stream + "\", \"ShardCount\": 1}");
+        cleanup.register(() -> kinesis(kinesisAuthorization, "DeleteStream", "{\"StreamName\": \"" + stream + "\"}"));
+        createRule(authorization, "deviceWillKinesisRule" + System.nanoTime(), willTopic,
+                "{\"kinesis\": {\"roleArn\": \"arn:aws:iam::000000000000:role/iot-rule-role\", \"streamName\": \"" + stream
+                        + "\", \"partitionKey\": \"device\"}}");
+        String clientId = "will-" + System.nanoTime();
+        MqttClient client = connect("ssl://127.0.0.1:" + TLS_PORT, clientId, device.sslContext(TLS_DIR).getSocketFactory(),
+                willTopic, "offline".getBytes(StandardCharsets.UTF_8));
+
+        AtomicReference<List<String>> records = new AtomicReference<>();
+        List<LogRecord> brokerLog;
+        try {
+            brokerLog = LogCapture.capture(IotMqttBrokerService.class, () -> {
+                given().when().delete("/connections/{clientId}", clientId).then().statusCode(200);
+                try {
+                    records.set(awaitKinesisRecords(kinesisAuthorization, stream));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("interrupted while waiting for the Last Will's record", e);
+                }
+            });
+        } finally {
+            client.close(true);
+        }
+
+        assertEquals(List.of(Base64.getEncoder().encodeToString("offline".getBytes(StandardCharsets.UTF_8))),
+                records.get(), "the Last Will's record reached the stream of the rule's account");
+        assertEquals(List.of(), brokerLog.stream()
+                .filter(entry -> entry.getLevel().intValue() >= Level.WARNING.intValue())
+                .map(entry -> entry.getMessage() + " " + entry.getThrown())
+                .toList(), "no rule evaluation failed");
+    }
+
     private static String signedBy(String account, String service) {
         return "AWS4-HMAC-SHA256 Credential=" + account + "/20260215/us-east-1/" + service + "/aws4_request, "
                 + "SignedHeaders=host, Signature=abc";
@@ -464,6 +513,12 @@ class IotMqttMutualTlsIntegrationTest {
     }
 
     private static MqttClient connect(String uri, String clientId, SSLSocketFactory socketFactory) throws Exception {
+        return connect(uri, clientId, socketFactory, null, null);
+    }
+
+    /** Connects with a QoS 1 Last Will on {@code willTopic} when it is not null. */
+    private static MqttClient connect(String uri, String clientId, SSLSocketFactory socketFactory,
+                                      String willTopic, byte[] willPayload) throws Exception {
         MqttClient client = new MqttClient(uri, clientId, new MemoryPersistence());
         MqttConnectOptions options = new MqttConnectOptions();
         options.setMqttVersion(MqttConnectOptions.MQTT_VERSION_3_1_1);
@@ -472,6 +527,9 @@ class IotMqttMutualTlsIntegrationTest {
         options.setAutomaticReconnect(false);
         if (socketFactory != null) {
             options.setSocketFactory(socketFactory);
+        }
+        if (willTopic != null) {
+            options.setWill(willTopic, willPayload, 1, false);
         }
         try {
             client.connect(options);

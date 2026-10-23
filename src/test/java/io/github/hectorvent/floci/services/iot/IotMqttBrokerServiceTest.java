@@ -29,6 +29,7 @@ import io.quarkus.tls.CertificateUpdatedEvent;
 import io.quarkus.tls.TlsConfiguration;
 import io.quarkus.tls.TlsConfigurationRegistry;
 import io.quarkus.tls.runtime.config.TlsConfig;
+import io.smallrye.common.vertx.VertxContext;
 import io.vertx.core.Context;
 import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
@@ -1641,6 +1642,26 @@ class IotMqttBrokerServiceTest {
         broker.evaluateRulesOnWorker(topic, afterDrainRan::countDown);
         assertTrue(afterDrainRan.await(10, TimeUnit.SECONDS), "capacity came back once the backlog drained");
         assertFalse(beyondBoundRan.get(), "the evaluation beyond the bound never ran");
+    }
+
+    /**
+     * DeleteConnection ends a session from an HTTP request, whose duplicated Vert.x context holds that
+     * request's CDI request scope; the rules of the session's Last Will and lifecycle event must not
+     * run with that context current.
+     */
+    @Test
+    void rulesSubmittedFromADuplicatedContextRunOffIt() throws Exception {
+        Context requestContext = VertxContext.createNewDuplicatedContext(vertx.getOrCreateContext());
+        AtomicReference<Boolean> ranOnDuplicatedContext = new AtomicReference<>();
+        CountDownLatch ran = new CountDownLatch(1);
+
+        requestContext.runOnContext(ignored -> broker.evaluateRulesOnWorker("devices/d1/metrics", () -> {
+            ranOnDuplicatedContext.set(VertxContext.isOnDuplicatedContext());
+            ran.countDown();
+        }));
+
+        assertTrue(ran.await(10, TimeUnit.SECONDS), "the rules ran");
+        assertFalse(ranOnDuplicatedContext.get(), "the rules ran on the request's duplicated context");
     }
 
     @Test

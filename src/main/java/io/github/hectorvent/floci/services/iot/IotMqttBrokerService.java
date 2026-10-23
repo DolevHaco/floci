@@ -16,6 +16,7 @@ import io.quarkus.tls.CertificateUpdatedEvent;
 import io.quarkus.tls.TlsConfiguration;
 import io.quarkus.tls.TlsConfigurationRegistry;
 import io.quarkus.tls.runtime.config.TlsConfig;
+import io.smallrye.common.vertx.VertxContext;
 import io.vertx.core.Vertx;
 import io.vertx.core.WorkerExecutor;
 import io.vertx.core.buffer.Buffer;
@@ -762,7 +763,8 @@ public class IotMqttBrokerService implements Resettable {
      * Stores, records and hands to the rule worker a message of the session in its account, which
      * the topic namespace, retained messages and rules belong to on AWS: the device certificate's
      * account on the TLS listener, the default one otherwise. The account is passed explicitly
-     * rather than through a request scope, which the rule worker would share with this event loop.
+     * because the event loop opens no request scope; the rule worker opens one for each matched
+     * rule, in that rule's account.
      */
     private void publishAsSession(ClientSession session, String topic, byte[] payload, boolean retain, int qos, long admitted) {
         iotService.get().publish(topic, payload, retain, qos, null, session.clientId(), session.accountId(),
@@ -776,7 +778,10 @@ public class IotMqttBrokerService implements Resettable {
      * {@link #MAX_PENDING_RULE_EVALUATIONS} evaluations are pending, running or waiting; beyond
      * that a publish's rules are skipped. A reset or a stop skips the rules of publishes still
      * waiting, and a publish received during the reset or while the broker is stopped never runs
-     * its rules.
+     * its rules. A publish scheduled from a duplicated Vert.x context, such as the Last Will that
+     * DeleteConnection publishes from its HTTP request, is submitted from that context's root, since
+     * the worker task runs on the submitting context and a duplicated one carries the request's CDI
+     * request scope.
      */
     void evaluateRulesOnWorker(String topic, Runnable rules) {
         evaluateRulesOnWorker(topic, rules, ruleState.get());
@@ -796,6 +801,20 @@ public class IotMqttBrokerService implements Resettable {
             return;
         }
         AtomicBoolean released = new AtomicBoolean();
+        if (VertxContext.isOnDuplicatedContext()) {
+            try {
+                VertxContext.getRootContext(Vertx.currentContext())
+                        .runOnContext(ignored -> submitRuleEvaluation(topic, rules, admitted, released));
+            } catch (RuntimeException dispatchFailure) {
+                releaseRuleEvaluation(released);
+                throw dispatchFailure;
+            }
+            return;
+        }
+        submitRuleEvaluation(topic, rules, admitted, released);
+    }
+
+    private void submitRuleEvaluation(String topic, Runnable rules, long admitted, AtomicBoolean released) {
         try {
             ruleWorker.executeBlocking(() -> {
                 try {
