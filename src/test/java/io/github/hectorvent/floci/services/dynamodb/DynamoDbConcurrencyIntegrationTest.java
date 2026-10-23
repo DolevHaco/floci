@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.dynamodb;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
@@ -39,6 +40,7 @@ import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -1054,7 +1056,9 @@ class DynamoDbConcurrencyIntegrationTest {
             assertTrue(tableStore.parked.await(10, TimeUnit.SECONDS), "the write never looked up its table");
             service.deleteTable("Counters", "us-east-1");
             tableStore.release.countDown();
-            write.get(10, TimeUnit.SECONDS);
+            ExecutionException failure = assertThrows(ExecutionException.class, () -> write.get(10, TimeUnit.SECONDS));
+            AwsException cause = assertInstanceOf(AwsException.class, failure.getCause());
+            assertEquals("ResourceNotFoundException", cause.getErrorCode());
         } finally {
             tableStore.release.countDown();
             pool.shutdownNow();
@@ -1063,6 +1067,79 @@ class DynamoDbConcurrencyIntegrationTest {
 
         assertTrue(itemStore.get("us-east-1::Counters").isEmpty(),
                 () -> "a deleted table's items must not be stored: " + itemStore.get("us-east-1::Counters"));
+    }
+
+    /**
+     * Parks {@code write} right after its first table lookup, deletes the table and creates it again
+     * under the same name, then lets the write finish. Returns what the write threw, or null.
+     */
+    private Throwable failureOfAWriteOvertakenByARecreate(ParkingTableStore tableStore, Runnable write)
+            throws Exception {
+        tableStore.parkNextGet.set(true);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> pending = pool.submit(write);
+            assertTrue(tableStore.parked.await(10, TimeUnit.SECONDS), "the write never looked up its table");
+            service.deleteTable("Counters", "us-east-1");
+            createCounterTable("us-east-1");
+            tableStore.release.countDown();
+            try {
+                pending.get(10, TimeUnit.SECONDS);
+                return null;
+            } catch (ExecutionException e) {
+                return e.getCause();
+            }
+        } finally {
+            tableStore.release.countDown();
+            pool.shutdownNow();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS), "thread pool did not terminate");
+        }
+    }
+
+    private void assertTheRecreatedTableHasNoLateItem(Throwable writeFailure,
+                                                      StorageBackend<String, Map<String, JsonNode>> itemStore) {
+        assertNull(service.getItem("Counters", pkKey("late"), "us-east-1"),
+                "a write that looked up the deleted table must not reach the table created after it");
+        Map<String, JsonNode> stored = itemStore.get("us-east-1::Counters").orElse(Map.of());
+        assertTrue(stored.isEmpty(), () -> "the recreated table must not store the earlier write: " + stored);
+        AwsException failure = assertInstanceOf(AwsException.class, writeFailure,
+                "the write must fail as a write to a deleted table does");
+        assertEquals("ResourceNotFoundException", failure.getErrorCode());
+    }
+
+    @RepeatedTest(REPEATS)
+    void updateItem_that_looked_up_a_table_since_deleted_and_recreated_does_not_reach_the_new_table()
+            throws Exception {
+        ParkingTableStore tableStore = new ParkingTableStore();
+        StorageBackend<String, Map<String, JsonNode>> itemStore = new InMemoryStorage<>();
+        service = new DynamoDbService(tableStore, itemStore, new RegionResolver("us-east-1", "000000000000"));
+        createCounterTable("us-east-1");
+        ObjectNode exprValues = mapper.createObjectNode();
+        exprValues.set(":v", numberAttr("1"));
+
+        Throwable failure = failureOfAWriteOvertakenByARecreate(tableStore, () -> service.updateItem("Counters",
+                pkKey("late"), null, "SET lateAttr = :v", null, exprValues, "NONE", "us-east-1"));
+
+        assertTheRecreatedTableHasNoLateItem(failure, itemStore);
+    }
+
+    @RepeatedTest(REPEATS)
+    void transactWriteItems_that_looked_up_a_table_since_deleted_and_recreated_does_not_reach_the_new_table()
+            throws Exception {
+        ParkingTableStore tableStore = new ParkingTableStore();
+        StorageBackend<String, Map<String, JsonNode>> itemStore = new InMemoryStorage<>();
+        service = new DynamoDbService(tableStore, itemStore, new RegionResolver("us-east-1", "000000000000"));
+        createCounterTable("us-east-1");
+        ObjectNode put = mapper.createObjectNode();
+        put.put("TableName", "Counters");
+        put.set("Item", pkKey("late"));
+        ObjectNode member = mapper.createObjectNode();
+        member.set("Put", put);
+
+        Throwable failure = failureOfAWriteOvertakenByARecreate(tableStore,
+                () -> service.transactWriteItems(List.of(member), "us-east-1", null, null));
+
+        assertTheRecreatedTableHasNoLateItem(failure, itemStore);
     }
 
     @RepeatedTest(REPEATS)
