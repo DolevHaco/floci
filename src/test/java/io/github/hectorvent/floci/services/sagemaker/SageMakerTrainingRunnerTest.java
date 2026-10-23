@@ -5,6 +5,7 @@ import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CopyArchiveFromContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.KillContainerCmd;
 import com.github.dockerjava.api.command.StopContainerCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.exception.NotModifiedException;
@@ -30,6 +31,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -39,6 +41,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -244,32 +248,90 @@ class SageMakerTrainingRunnerTest {
     @Test
     void aGracefulStopThatTimesOutStillStopsTheJobAndKeepsItsModelArtifacts() throws Exception {
         // floci.docker.api-timeout-seconds below the 120 s grace: the client gives up on a container
-        // that ignores SIGTERM before Docker answers the stop.
+        // that ignores SIGTERM before Docker answers the stop, so it is killed once the window ends.
+        AtomicLong stoppedAt = new AtomicLong();
         StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
-        when(stop.exec()).thenThrow(new RuntimeException(new SocketTimeoutException("Read timed out")));
+        when(stop.exec()).thenAnswer(invocation -> {
+            stoppedAt.set(System.nanoTime());
+            throw new RuntimeException(new SocketTimeoutException("Read timed out"));
+        });
+        AtomicLong killedAt = new AtomicLong();
+        KillContainerCmd kill = mock(KillContainerCmd.class);
+        when(docker.killContainerCmd("container")).thenReturn(kill);
+        when(kill.exec()).thenAnswer(invocation -> {
+            killedAt.set(System.nanoTime());
+            return null;
+        });
         CopyArchiveFromContainerCmd copyModel = mock(CopyArchiveFromContainerCmd.class);
-        SageMakerTrainingRunner runner = dockerBackedRunner();
+        AtomicBoolean readWhileRunning = new AtomicBoolean();
+        SageMakerTrainingRunner runner = dockerBackedRunner(Duration.ofMillis(300), Duration.ofMillis(10));
 
-        TrainingJobResource job = runPastMaxRuntime(runner, stop, copyModel);
+        TrainingJobResource job = runPastMaxRuntime(runner, stop, copyModel, () -> killedAt.get() == 0,
+                readWhileRunning);
 
         assertEquals("Stopped", job.trainingJobStatus);
         assertEquals("MaxRuntimeExceeded", job.secondaryStatus);
         assertNull(job.failureReason);
         assertEquals("s3://bucket/output/slow/output/model.tar.gz", job.modelArtifactsS3ModelArtifacts);
-        InOrder order = inOrder(stop, copyModel, lifecycle);
+        assertFalse(readWhileRunning.get(), "the model must not be read while the container still runs");
+        assertTrue(killedAt.get() - stoppedAt.get() >= Duration.ofMillis(250).toNanos(),
+                "the container must be killed only once the grace window has ended");
+        InOrder order = inOrder(stop, kill, copyModel, lifecycle);
         order.verify(stop).exec();
+        order.verify(kill).exec();
         order.verify(copyModel).exec();
         order.verify(lifecycle).stopAndRemove("container", null);
+        runner.stopManagedContainers();
+    }
+
+    @Test
+    void aContainerStillSavingAfterAFailedStopHasItsModelReadOnlyOnceItExits() throws Exception {
+        // The client gave up on the stop while the container was still writing /opt/ml/model; it
+        // exits 200 ms later, well inside the window.
+        AtomicLong exitsAt = new AtomicLong(Long.MAX_VALUE);
+        StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
+        when(stop.exec()).thenAnswer(invocation -> {
+            exitsAt.set(System.nanoTime() + Duration.ofMillis(200).toNanos());
+            throw new RuntimeException(new SocketTimeoutException("Read timed out"));
+        });
+        KillContainerCmd kill = mock(KillContainerCmd.class);
+        when(docker.killContainerCmd("container")).thenReturn(kill);
+        CopyArchiveFromContainerCmd copyModel = mock(CopyArchiveFromContainerCmd.class);
+        AtomicBoolean readWhileRunning = new AtomicBoolean();
+        SageMakerTrainingRunner runner = dockerBackedRunner(Duration.ofSeconds(10), Duration.ofMillis(10));
+
+        TrainingJobResource job = runPastMaxRuntime(runner, stop, copyModel,
+                () -> System.nanoTime() < exitsAt.get(), readWhileRunning);
+
+        assertEquals("Stopped", job.trainingJobStatus);
+        assertEquals("MaxRuntimeExceeded", job.secondaryStatus);
+        assertNull(job.failureReason);
+        assertEquals("s3://bucket/output/slow/output/model.tar.gz", job.modelArtifactsS3ModelArtifacts);
+        assertFalse(readWhileRunning.get(), "the model must not be read while the container still runs");
+        verify(kill, never()).exec();
         runner.stopManagedContainers();
     }
 
     /** Runs a job whose container is still running when its one-second MaxRuntimeInSeconds is up. */
     private TrainingJobResource runPastMaxRuntime(SageMakerTrainingRunner runner, StopContainerCmd stop,
                                                   CopyArchiveFromContainerCmd copyModel) throws Exception {
-        inspectReports(new AtomicBoolean(true), 0);
+        return runPastMaxRuntime(runner, stop, copyModel, () -> true, new AtomicBoolean());
+    }
+
+    /**
+     * As above, with the container running for as long as {@code running} says so;
+     * {@code readWhileRunning} records whether the model was read from a container still running.
+     */
+    private TrainingJobResource runPastMaxRuntime(SageMakerTrainingRunner runner, StopContainerCmd stop,
+                                                  CopyArchiveFromContainerCmd copyModel, BooleanSupplier running,
+                                                  AtomicBoolean readWhileRunning) throws Exception {
+        inspectReports(running, 0);
         when(docker.stopContainerCmd("container")).thenReturn(stop);
         when(docker.copyArchiveFromContainerCmd("container", "/opt/ml/model")).thenReturn(copyModel);
-        when(copyModel.exec()).thenReturn(new ByteArrayInputStream(tar("model/model.txt", "saved on SIGTERM")));
+        when(copyModel.exec()).thenAnswer(invocation -> {
+            readWhileRunning.set(running.getAsBoolean());
+            return new ByteArrayInputStream(tar("model/model.txt", "saved on SIGTERM"));
+        });
         SageMakerService service = mock(SageMakerService.class);
         Semaphore reports = reportsOf(service);
         TrainingJobResource job = job("slow", "000000000000", "us-east-1");
@@ -304,13 +366,17 @@ class SageMakerTrainingRunnerTest {
     }
 
     private void inspectReports(AtomicBoolean running, long exitCode) {
+        inspectReports(running::get, exitCode);
+    }
+
+    private void inspectReports(BooleanSupplier running, long exitCode) {
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         InspectContainerResponse response = mock(InspectContainerResponse.class);
         InspectContainerResponse.ContainerState state = mock(InspectContainerResponse.ContainerState.class);
         when(docker.inspectContainerCmd("container")).thenReturn(inspect);
         when(inspect.exec()).thenReturn(response);
         when(response.getState()).thenReturn(state);
-        when(state.getRunning()).thenAnswer(invocation -> running.get());
+        when(state.getRunning()).thenAnswer(invocation -> running.getAsBoolean());
         when(state.getExitCodeLong()).thenReturn(exitCode);
     }
 
@@ -323,6 +389,21 @@ class SageMakerTrainingRunnerTest {
 
     /** A runner that builds real container specs and drives a mocked lifecycle and Docker client. */
     private SageMakerTrainingRunner dockerBackedRunner() {
+        EmulatorConfig config = dockerBackedConfig();
+        ContainerBuilder builder = new ContainerBuilder(config, mock(DockerHostResolver.class), mock(EmbeddedDnsServer.class));
+        return new SageMakerTrainingRunner(builder, lifecycle, logStreamer, config, mock(ContainerDetector.class),
+                s3, new ObjectMapper(), mock(SageMakerGpuResolver.class));
+    }
+
+    /** As {@link #dockerBackedRunner()}, with a shorter MaxRuntime stop window and exit poll. */
+    private SageMakerTrainingRunner dockerBackedRunner(Duration maxRuntimeStopGrace, Duration exitPollInterval) {
+        EmulatorConfig config = dockerBackedConfig();
+        ContainerBuilder builder = new ContainerBuilder(config, mock(DockerHostResolver.class), mock(EmbeddedDnsServer.class));
+        return new SageMakerTrainingRunner(builder, lifecycle, logStreamer, config, mock(ContainerDetector.class),
+                s3, new ObjectMapper(), mock(SageMakerGpuResolver.class), maxRuntimeStopGrace, exitPollInterval);
+    }
+
+    private EmulatorConfig dockerBackedConfig() {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().dockerNetwork()).thenReturn(Optional.empty());
         when(config.services().sagemaker().dockerNetwork()).thenReturn(Optional.empty());
@@ -332,9 +413,7 @@ class SageMakerTrainingRunnerTest {
         new DockerArchiveUploadFixture(docker, "container");
         when(lifecycle.create(any(ContainerSpec.class))).thenReturn("container");
         when(lifecycle.getDockerClient()).thenReturn(docker);
-        ContainerBuilder builder = new ContainerBuilder(config, mock(DockerHostResolver.class), mock(EmbeddedDnsServer.class));
-        return new SageMakerTrainingRunner(builder, lifecycle, logStreamer, config, mock(ContainerDetector.class),
-                s3, new ObjectMapper(), mock(SageMakerGpuResolver.class));
+        return config;
     }
 
     private static TrainingJobResource job(String name, String accountId, String region) {

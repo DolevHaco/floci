@@ -50,6 +50,7 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
     private static final String LOG_GROUP = "/aws/sagemaker/TrainingJobs";
     // StoppingCondition: past MaxRuntimeInSeconds the algorithm gets SIGTERM and 120 seconds to save its model.
     private static final int MAX_RUNTIME_STOP_GRACE_SECONDS = 120;
+    private static final Duration EXIT_POLL_INTERVAL = Duration.ofMillis(500);
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
@@ -59,6 +60,8 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
     private final S3Service s3Service;
     private final ObjectMapper mapper;
     private final SageMakerGpuResolver gpuResolver;
+    private final Duration maxRuntimeStopGrace;
+    private final Duration exitPollInterval;
     // Replaced by afterReset() after a state reset, whose container teardown shuts this pool down.
     private volatile ExecutorService executor = Executors.newCachedThreadPool();
     private final ConcurrentHashMap<String, String> containers = new ConcurrentHashMap<>();
@@ -73,6 +76,15 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
                                    ContainerLogStreamer logStreamer, EmulatorConfig config,
                                    ContainerDetector containerDetector, S3Service s3Service, ObjectMapper mapper,
                                    SageMakerGpuResolver gpuResolver) {
+        this(containerBuilder, lifecycleManager, logStreamer, config, containerDetector, s3Service, mapper,
+                gpuResolver, Duration.ofSeconds(MAX_RUNTIME_STOP_GRACE_SECONDS), EXIT_POLL_INTERVAL);
+    }
+
+    SageMakerTrainingRunner(ContainerBuilder containerBuilder, ContainerLifecycleManager lifecycleManager,
+                            ContainerLogStreamer logStreamer, EmulatorConfig config,
+                            ContainerDetector containerDetector, S3Service s3Service, ObjectMapper mapper,
+                            SageMakerGpuResolver gpuResolver, Duration maxRuntimeStopGrace,
+                            Duration exitPollInterval) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -81,6 +93,8 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
         this.s3Service = s3Service;
         this.mapper = mapper;
         this.gpuResolver = gpuResolver;
+        this.maxRuntimeStopGrace = maxRuntimeStopGrace;
+        this.exitPollInterval = exitPollInterval;
     }
 
     public void runAsync(TrainingJobResource job, SageMakerService service) {
@@ -134,16 +148,18 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
             if (exit == null) {
                 // SageMaker sends SIGTERM and waits so the algorithm can save its model, then uploads
                 // whatever it saved: the container must outlive the stop for that upload.
+                long graceDeadline = System.nanoTime() + maxRuntimeStopGrace.toNanos();
                 try {
                     lifecycleManager.getDockerClient().stopContainerCmd(containerId)
-                            .withTimeout(MAX_RUNTIME_STOP_GRACE_SECONDS).exec();
+                            .withTimeout(Math.toIntExact(maxRuntimeStopGrace.toSeconds())).exec();
                 } catch (NotModifiedException alreadyStopped) {
                     LOG.debugv("SageMaker training container {0} exited before its runtime stop (304)", containerId);
                 } catch (RuntimeException stopFailed) {
-                    // A Docker API timeout below the grace window gives up on a container that ignores
-                    // SIGTERM; the job still ran out of time, and the forced removal below ends it.
+                    // The Docker client gave up (a Docker API timeout below the grace window) while the
+                    // container may still be saving its model; the job still ran out of time.
                     LOG.warnv("SageMaker training container {0} did not confirm its runtime stop: {1}",
                             containerId, stopFailed.getMessage());
+                    awaitExitOrKill(containerId, graceDeadline);
                 }
                 job.modelArtifactsS3ModelArtifacts = uploadModelArtifacts(containerId, job);
                 lifecycleManager.stopAndRemove(containerId, logs);
@@ -346,9 +362,31 @@ public class SageMakerTrainingRunner implements ContainerTeardown, Resettable {
             if (exit != null) {
                 return exit;
             }
-            Thread.sleep(500);
+            Thread.sleep(exitPollInterval.toMillis());
         }
         return null;
+    }
+
+    /**
+     * Waits for the container to exit until the grace window that began with the stop request ends,
+     * then kills it if it is still running, so its model is read only once nothing writes to it.
+     */
+    private void awaitExitOrKill(String containerId, long graceDeadlineNanos) throws InterruptedException {
+        while (getExitCodeIfStopped(containerId) == null) {
+            long remainingMillis = TimeUnit.NANOSECONDS.toMillis(graceDeadlineNanos - System.nanoTime());
+            if (remainingMillis <= 0) {
+                LOG.warnv("SageMaker training container {0} still ran when its stop window ended; killing it",
+                        containerId);
+                try {
+                    lifecycleManager.getDockerClient().killContainerCmd(containerId).exec();
+                } catch (RuntimeException killFailed) {
+                    LOG.warnv("Could not kill SageMaker training container {0}: {1}", containerId,
+                            killFailed.getMessage());
+                }
+                return;
+            }
+            Thread.sleep(Math.min(exitPollInterval.toMillis(), remainingMillis));
+        }
     }
 
     private Integer getExitCodeIfStopped(String containerId) {
