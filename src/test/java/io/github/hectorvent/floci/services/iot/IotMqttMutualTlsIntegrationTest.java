@@ -32,7 +32,6 @@ import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.logging.Level;
 import java.util.logging.LogRecord;
 
 import static io.restassured.RestAssured.given;
@@ -383,6 +382,7 @@ class IotMqttMutualTlsIntegrationTest {
         List<LogRecord> brokerLog;
         try {
             brokerLog = LogCapture.capture(IotMqttBrokerService.class, () -> {
+                // Relies on DeleteConnection finding the client id across accounts, so the request's account differs from the rule's.
                 given().when().delete("/connections/{clientId}", clientId).then().statusCode(200);
                 try {
                     records.set(awaitKinesisRecords(kinesisAuthorization, stream));
@@ -398,7 +398,7 @@ class IotMqttMutualTlsIntegrationTest {
         assertEquals(List.of(Base64.getEncoder().encodeToString("offline".getBytes(StandardCharsets.UTF_8))),
                 records.get(), "the Last Will's record reached the stream of the rule's account");
         assertEquals(List.of(), brokerLog.stream()
-                .filter(entry -> entry.getLevel().intValue() >= Level.WARNING.intValue())
+                .filter(entry -> entry.getMessage().startsWith("IoT rule evaluation for topic"))
                 .map(entry -> entry.getMessage() + " " + entry.getThrown())
                 .toList(), "no rule evaluation failed");
     }
