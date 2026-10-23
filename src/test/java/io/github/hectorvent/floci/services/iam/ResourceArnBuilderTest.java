@@ -1619,7 +1619,7 @@ class ResourceArnBuilderTest {
     }
 
     @Test
-    void ssmChecksEachLiteralNameDeleteParametersNames() {
+    void ssmChecksEachLiteralNameInDeleteParametersNames() {
         setJsonBody("{\"Names\":[\"/app/a:x\",\"/app/b\"]}");
         assertEquals(List.of("arn:aws:ssm:us-east-1:000000000000:parameter/app/a:x",
                         "arn:aws:ssm:us-east-1:000000000000:parameter/app/b"),
@@ -1627,7 +1627,7 @@ class ResourceArnBuilderTest {
     }
 
     @Test
-    void ssmChecksTheLiteralPathAPathQueryRequests() {
+    void ssmChecksTheLiteralPathOfAPathQuery() {
         String literal = "arn:aws:ssm:us-east-1:000000000000:parameter/app/a:x";
         setJsonBody("{\"Path\":\"/app/a:x\"}");
         assertEquals(List.of(literal),
