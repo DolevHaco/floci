@@ -221,7 +221,7 @@ class IamListPaginationIntegrationTest {
                 .statusCode(400)
                 .body("ErrorResponse.Error.Code", equalTo("ValidationError"))
                 .body("ErrorResponse.Error.Message", equalTo(
-                        "1 validation error detected: Value '0' at 'maxItems' failed to satisfy "
+                        "1 validation error detected: Value at 'maxItems' failed to satisfy "
                                 + "constraint: Member must have value greater than or equal to 1"));
 
             iam(action).formParam("MaxItems", "1001")
@@ -229,7 +229,7 @@ class IamListPaginationIntegrationTest {
                 .statusCode(400)
                 .body("ErrorResponse.Error.Code", equalTo("ValidationError"))
                 .body("ErrorResponse.Error.Message", equalTo(
-                        "1 validation error detected: Value '1001' at 'maxItems' failed to satisfy "
+                        "1 validation error detected: Value at 'maxItems' failed to satisfy "
                                 + "constraint: Member must have value less than or equal to 1000"));
 
             iam(action).formParam("MaxItems", "1000").when().post("/").then().statusCode(200);
