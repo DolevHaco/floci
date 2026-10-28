@@ -1463,7 +1463,8 @@ action is denied. The routed protocol determines the status, not just the reques
 A request is checked against the resources it names. Floci builds their ARNs itself for S3, Lambda,
 SQS, SNS, DynamoDB, Kinesis, SSM, KMS, IAM, Resource Groups, EventBridge Scheduler, EventBridge
 Pipes, Aurora DSQL, EKS, CloudWatch Logs, Secrets Manager and STS. For Elastic Load Balancing, ECR,
-Step Functions, EventBridge and Amazon Cognito user pools they come from a table generated from AWS's Service
+Step Functions, EventBridge, Amazon Cognito user pools and identity pools, Amazon Data Firehose, Cloud
+Map, ACM and CodePipeline they come from a table generated from AWS's Service
 Reference and botocore, `src/main/resources/aws/iam-request-resources.json`, which gives each
 operation's action, the resource types that action acts on with their ARN formats, and the request
 members that name them: a member holding a resource's ARN, which counts when it matches the format
@@ -1485,7 +1486,15 @@ selects the registry its handler acts in, so `repository/<name>` is checked in t
 `registryId` that is no account id names no repository, while a null one is the caller's, as ECR
 reads it. `StartExecution` and
 `StartSyncExecution` take Step Functions Local's `<stateMachineArn>#<test case>` and run the
-machine before the `#`, so that machine is the one checked. An EventBridge rule is on the event bus
+machine before the `#`, so that machine is the one checked. `StartPipelineExecution` and
+`GetPipelineState` name their pipeline by a bare `name`, which is read as the pipeline's;
+`CreatePipeline` and `UpdatePipeline` by `pipeline.name`, not by `pipeline.roleArn`, which holds the
+role CodePipeline assumes; `PutWebhook` names the webhook by `webhook.name` and the pipeline it
+connects to by `webhook.targetPipeline`. A CodePipeline webhook is `webhook:<name>`, the ARN AWS
+gives it, and a custom action type `actiontype:Custom/<category>/<provider>/<version>`, its owner
+being `Custom`, which the request does not give. Cloud Map's `CreateService` is checked on the
+namespace its `NamespaceId` names or, when it gives none or a JSON null, the one its
+`DnsConfig.NamespaceId` names, as Cloud Map reads them, and on the service it creates. An EventBridge rule is on the event bus
 its request's `EventBusName` names, by name or by ARN, and on the default bus when it names none
 or gives a null, whose rules are `rule/<name>`, with no bus; a bus ARN of another account, the
 default bus's included, names that account's rule, checked as given and as the caller's own, which
@@ -1849,7 +1858,11 @@ resource, so its tags are checked on that one, built from the parent's ARN with 
 `listener/app/<load balancer name>/<load balancer id>/*`, and `CreateRule`'s on the new
 `listener-rule/...` under its listener. So the AWS Load Balancer Controller's policy, which allows
 `AddTags` at creation only on target groups and application and network load balancers, and on
-listeners and rules, holds. Where the tagging action takes
+listeners and rules, holds. A create that names another resource beside the one it makes tags the
+one it makes alone, the resource of the type it is named after: Cloud Map's `CreateService` is
+checked on its namespace and on `service/*`, and its tags on `service/*`; CodePipeline's
+`PutWebhook` on the webhook and the pipeline it connects to, and its tags on the webhook. Where the
+tagging action takes
 its namespace's `CreateAction` key, as `ec2:CreateTags`, `ecs:TagResource`, CloudFormation's
 `TagResource` and Elastic Load Balancing's `AddTags` do, the key is the operation's name:
 `ec2:CreateAction` is `RunInstances` for an instance launched with tags. The operation's own action
