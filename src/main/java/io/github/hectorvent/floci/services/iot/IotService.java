@@ -1229,19 +1229,17 @@ public class IotService {
     }
 
     /**
-     * A publish from outside the broker, such as the data plane Publish API: retained, recorded and
-     * run through the topic rules before it returns, then delivered to the broker's matching
-     * subscribers. {@code clientId} is what a rule's clientid() reports, null for the data plane.
+     * A publish from outside the broker: the QoS is checked, the retained message is stored and the
+     * topic rules run before it returns. When {@code clientId} is null, as on the data plane, the
+     * message is then delivered to matching subscribers. A publish that names a client is one the
+     * broker is already fanning out itself.
      */
     public void publish(String topic, byte[] payload, boolean retain, int qos, String region, String clientId) {
-        if (qos == 2) {
-            throw new AwsException("InvalidRequestException", "QoS 2 is currently not supported", 400);
-        }
-        if (qos != 0 && qos != 1) {
-            throw new AwsException("InvalidRequestException", "Invalid QoS value: " + qos, 400);
-        }
+        validatePublishQos(qos);
         publish(topic, payload, retain, qos, region, clientId, Runnable::run);
-        mqttBrokerService.publish(topic, payload, qos);
+        if (clientId == null) {
+            mqttBrokerService.publish(topic, payload == null ? new byte[0] : payload, qos);
+        }
     }
 
     /**
@@ -1277,14 +1275,24 @@ public class IotService {
 
     /**
      * An IoT Data {@code Publish} over HTTP: stored, recorded and run through the rules as
-     * {@link #publish} does, then delivered to the topic's MQTT subscribers, as the AWS message
-     * broker delivers HTTP and MQTT publishes alike. A reserved {@code $aws/} topic is not fanned out.
+     * {@link #publish} does, then delivered once to the topic's MQTT subscribers. A reserved
+     * {@code $aws/} topic is not delivered; the broker publishes the service's own response.
      */
     public void publishOverHttp(String topic, byte[] payload, boolean retain, int qos, String region) {
         byte[] message = payload == null ? new byte[0] : payload;
-        publish(topic, message, retain, qos, region, null);
+        validatePublishQos(qos);
+        publish(topic, message, retain, qos, region, null, Runnable::run);
         if (!topic.startsWith("$aws/")) {
             mqttBrokerService.publish(topic, message, qos);
+        }
+    }
+
+    private static void validatePublishQos(int qos) {
+        if (qos == 2) {
+            throw new AwsException("InvalidRequestException", "QoS 2 is currently not supported", 400);
+        }
+        if (qos != 0 && qos != 1) {
+            throw new AwsException("InvalidRequestException", "Invalid QoS value: " + qos, 400);
         }
     }
 
